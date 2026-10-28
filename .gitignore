@@ -1,0 +1,11 @@
+# SDK fetched by tools/fetch_sdk.py
+/sdk/
+
+# Build outputs
+*.elf
+*.bin
+*.map
+*.app
+*_assets.h
+
+__pycache__/
