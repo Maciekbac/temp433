@@ -23,8 +23,8 @@
 # Frame layouts (bit positions, timings, checks) follow the protocol
 # descriptions in the rtl_433 device sources, used as a specification only:
 # the decoder is written from them, no code is taken.  Bit positions count
-# from the first data bit (after `skip` leading bits), MSB first; times are in
-# PA4 samples of 50 us.
+# from the first data bit (after `skip` leading bits; the fixed bits from the
+# row start), MSB first; times are in PA4 samples of 50 us.
 import os, struct, sys
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.environ.get("SDK", "sdk"))
@@ -33,41 +33,22 @@ from app_assets import Assets
 US = 50
 def s(us):
     return round(us / US)
-
-DIAG = os.environ.get("DIAG") == "1"
+def mid(a_us, b_us):
+    """bit threshold between two times: a run longer than it is the long one"""
+    return (a_us + b_us) // (2 * US)
 
 # The screen texts, each padded to a multiple of 4 bytes: draw() reads them in
-# one asset_read into a word-aligned stack block.  The DIAG build keeps the
-# diagnostic screen of stage 1, the release build has the sensor table.
+# one asset_read into a word-aligned stack block.
 UI = [
-    ("T_TITLE",  "TEMP 433 DIAG" if DIAG else "TEMP 433"),
+    ("T_TITLE",  "TEMP 433"),
     ("T_AUTO",   "AUTO "),
     ("T_VFO",    "VFO "),
     ("T_OK",     " ok "),
     ("T_UNKNOWN", " ?"),
-    ("T_DBM",    "dBm"),
     ("T_VHF1",   "No 433 sensors on VHF"),
     ("T_VHF2",   "Tune the VFO to 433.920"),
+    ("T_HINT",   "5: search 433.80-434.04 (AUTO)"),   # VFO, empty table
 ]
-if DIAG:
-    UI += [
-        ("T_HIGH",   " High 6dB"),
-        ("T_NORMAL", " Normal 10dB"),
-        ("T_LOW",    " Low 15dB"),
-        ("T_T",      "t "),
-        ("T_STOPS",  "s stops "),
-        ("T_EMPTY",  " empty "),
-        ("T_PACKETS", "packets "),
-        ("T_NOISE",  "noise "),
-        ("T_ID",     " id "),
-        ("T_CH",     " ch"),
-        ("T_BAT",    " bat low"),
-        ("T_NONE",   "no sensor yet"),
-        ("T_AGE",    "age "),
-        ("T_KEYS",   "s 1spk 2clr 3sens 5mode"),
-    ]
-else:
-    UI += [("T_HINT", "5: search 433.80-434.04 (AUTO)")]   # VFO, empty table
 
 # Status line icons, vertical bytes, bit 0 at the top.  The speaker and the
 # scroll marks are the bitmaps of the F4HWN apps (FoxHunt, AIS RX; Apache-2.0,
@@ -85,58 +66,201 @@ for index in range(8):
     tail += [(u if index & 2 else 0) | (d if index & 4 else 0) for u, d in zip(UP, DN)]
     tails += bytes(tail)
 
-PPM = 0
-# (name, kind, bit threshold, row gap, sync pulse (PWM), glitch run, pulse,
-# longest pulse) + a pad byte (8 B: i * 8 is a shift): kind and sync are not
-# read yet (PWM, stage 3).
-# A pulse longer than the longest is noise that switched the comparator on
-# early in the gap before it (radio log 2026-10-29): its excess goes back to
-# that gap.  255: off (PWM, where the pulse is the bit).
+# ---- timing families ----------------------------------------------------------
+# (name, kind, bit threshold, brk, end, glitch run, pulse, longest pulse) + a
+# pad byte (8 B: i * 8 is a shift).
+#   PPM (kind 0): the gap after a pulse is the bit; a gap longer than brk ends
+#     the row (end 255: unused).  A pulse longer than pmax is noise that
+#     switched the comparator on early in the gap before it (radio log
+#     2026-10-29): its excess goes back to that gap.
+#   PWM (kind 1: a long pulse is 1, as the rtl_433 decoders of these sensors
+#     read them after inverting; kind 3: a short pulse is 1): a pulse longer
+#     than brk is a sync pulse and ends the row, a gap longer than end ends it
+#     after its bit; pmax 255 (off).  One family per timing, the thresholds
+#     halfway (a shared one left too little margin, e.g. the HG02832 long
+#     pulse of 612 us against the Bresser sync pulse of 750 us).
+PPM, PWM, PWM_SHORT1 = 0, 1, 3
 FAMILIES = [
-    ("PPM 1000/2000", PPM, s(1500), s(3000), 0, 3, s(500), s(800)),   # Rubicson, Nexus: gaps 1000/2000, sync 4000
-    ("PPM 2000/4000", PPM, s(3100), s(6500), 0, 3, s(500), s(800)),   # GT-WT-02, Prologue: gaps 2000/4000, sync ~9000
+    ("PPM 1000/2000", PPM, s(1500), s(3000), 255, 3, s(500), s(800)),   # Rubicson, Nexus: sync 4000
+    ("PPM 2000/4000", PPM, s(3100), s(6500), 255, 3, s(500), s(800)),   # AHFL 2100/4150, GT-WT-02 2500/5000: sync >= 8000
+    ("PPM 576/1536",  PPM, s(1050), s(2000), 255, 3, s(500), s(800)),   # AFW2A1: sync 3900
+    ("PWM 208/417",   PWM, mid(208, 417), mid(417, 833), s(1000), 2, 0, 255),   # TX141TH: sync 833
+    ("PWM 250/500",   PWM, mid(250, 500), mid(500, 750), s(1000), 2, 0, 255),   # Bresser 3CH: sync 750
+    ("PWM 252/612",   PWM, mid(252, 612), mid(612, 860), s(1000), 2, 0, 255),   # HG02832: sync 860
+    ("PWM 280/796",   PWM, mid(280, 796), mid(796, 1836), s(1200), 2, 0, 255),  # EMOS: sync 1836, gaps <= 796
+    ("PWM 550/1400",  PWM_SHORT1, mid(550, 1400), 255, s(2000), 2, 0, 255),     # La Crosse TX: gap 1000, no sync
 ]
 
-# checks
-C_NONE, C_NIBSUM, C_CRC8 = range(3)
-# temperature encodings (x0.1 C on the screen)
-T_S12 = 1
-# humidity: its length in bits (0: none)
-H_NONE, H_U7, H_U8 = 0, 7, 8
-F_CH1, F_BATOK = 1, 2            # channel shown +1; battery bit 1 = OK (else 1 = low)
+# ---- checks -------------------------------------------------------------------
+C_NONE, C_SUM, C_DIGEST = range(3)
 
-# name (<= 9 chars), family, bits min/max (with skip), skip, flags, check, c1 c2 c3, repeats,
-# fixed (pos, len, value), id (pos, len), channel (pos, len), battery bit, temp (pos, enc), hum (pos, bits)
+NIBBLE_SUM = (C_SUM, 4, 0, 0, 0)        # the nibbles (bytes) of the first c1 bits,
+BYTE_SUM = (C_SUM, 8, 0, 0, 0)          # the last one zero padded
+
+def _step(k, poly, w):
+    top, mask = 1 << (w - 1), (1 << w) - 1
+    return ((k << 1) ^ poly) & mask if k & top else (k << 1) & mask
+
+def crc_digest(poly, w, length, init=0, per8=False, sub=None):
+    """C_DIGEST constants of a CRC (MSB first, no reflection, no final XOR) of
+    width w over `length` message bits: the start key is the CRC that bit 0
+    alone leaves, x starts as the init pushed through `length` zero bits, and
+    the key steps back with (poly >> 1) | top bit (poly must be odd)."""
+    assert poly & 1
+    key = poly
+    for _ in range(length - 1):
+        key = _step(key, poly, w)
+    x0 = init
+    for _ in range(length):
+        x0 = _step(x0, poly, w)
+    return (C_DIGEST, key, x0, (poly >> 1) | (1 << (w - 1)), (0xF if sub is None else sub) << 4 | per8)
+
+def lfsr_digest(gen, key, length):
+    """C_DIGEST constants of an LFSR digest that takes the bits last to first
+    (bytes last to first, bits LSB first) with the key stepped left: run first
+    to last, the key starts where that one ends and steps back"""
+    for _ in range(length - 1):
+        key = _step(key, gen, 8)
+    return (C_DIGEST, key, 0, (gen >> 1) | 0x80, 0xF0)
+
+# temperature: t_fl flags, t_off x 10 below 0 C (0.1 C) or below 32 F (0.1 F)
+T_SIGNED, T_LE, T_DEC, T_F = 1, 2, 4, 8
+S12 = (T_SIGNED, 0)
+F900 = (T_F, 122)                # 0.1 F + 900, i.e. 1220 below 32 F
+F_CH1, F_BATOK, F_HSWAP, F_HBCD = 1, 2, 4, 8
+F_HREJ, F_CHNZ = 16, 32           # rtl_433 drops a frame with a humidity over 100 % / channel 0
+
+# name (<= 9 chars), family, bits min/max, skip, flags, repeats,
+# check (kind, ca, cb, cc, cfl) with c1 (bits checked), cpos and cw (the check field),
+# fixed (pos, len, value) from the row start, id (pos, len), channel (pos, len),
+# battery bit, temp (pos, flags, offset), hum (pos, bits)
 P = []
-def proto(name, fam, bits, skip, flags, check, c, reps, fixed, ident, ch, bat, temp, hum):
-    P.append((name, fam, bits, skip, flags, check, c, reps, fixed, ident, ch, bat, temp, hum))
+def proto(name, fam, bits, skip, flags, reps, check, c, fixed, ident, ch, bat, temp, hum):
+    P.append((name, fam, bits, skip, flags, reps, check, c, fixed, ident, ch, bat, temp, hum))
 
-# Within a family the protocols with a check come first: Nexus and Prologue
-# have none, so a Rubicson frame would pass as Nexus and a GT-WT-02 frame
-# (37 bits) as Prologue if they were tried before.
+NOCHECK = (C_NONE, 0, 0, 0, 0)
+# Within a family the protocols with a check come first (the no-check Nexus,
+# Prologue and AFW2A1 would otherwise take their frames), the stronger checks
+# before the weaker ones.
 # PPM 1000/2000
-proto("RUBICSON", 0, (36, 38), 0, F_CH1 | F_BATOK, C_CRC8, (28, 0x31, 0x6C), 1,
-      (24, 4, 0xF), (0, 8), (10, 2), 8, (12, T_S12), (0, H_NONE))           # + TFA 30.3197, inFactory PT-310
-proto("NEXUS", 0, (36, 37), 0, F_CH1 | F_BATOK, C_NONE, (0, 0, 0), 2,
-      (24, 4, 0xF), (0, 8), (10, 2), 8, (12, T_S12), (28, H_U8))            # + Sencor, Solight, FreeTec, TFA 30.3209
+proto("RUBICSON", 0, (36, 38), 0, F_CH1 | F_BATOK, 1, crc_digest(0x31, 8, 32, 0x6C), (28, 28, 8),
+      (24, 4, 0xF), (0, 8), (10, 2), 8, (12,) + S12, (0, 0))      # + Solight TE44, TFA 30.3197, inFactory PT-310
+proto("NEXUS", 0, (36, 37), 0, F_CH1 | F_BATOK | F_HREJ, 2, NOCHECK, (0, 0, 0),
+      (24, 4, 0xF), (0, 8), (10, 2), 8, (12,) + S12, (28, 8))     # + Sencor, Solight TE82S, FreeTec, TFA 30.3209
 # PPM 2000/4000
-proto("GT-WT-02", 1, (37, 37), 0, F_CH1, C_NIBSUM, (31, 6, 0), 1,
-      None, (0, 8), (10, 2), 8, (12, T_S12), (24, H_U7))                    # Aldi Globaltronics
-proto("GT-WT-02", 1, (39, 39), 2, F_CH1, C_NIBSUM, (31, 6, 0), 1,
-      None, (0, 8), (10, 2), 8, (12, T_S12), (24, H_U7))                    # Lidl AURIO YJ-T12: 2 extra bits
-proto("PROLOGUE", 1, (36, 37), 0, F_CH1 | F_BATOK, C_NONE, (0, 0, 0), 2,
-      (2, 2, 0x1), (4, 8), (14, 2), 12, (16, T_S12), (28, H_U8))            # type 9/5; + ThermoPro TX2
+proto("AUR-AHFL", 1, (42, 42), 0, F_CH1 | F_BATOK, 1, NIBBLE_SUM, (36, 36, 6),
+      (31, 5, 0x04), (0, 8), (10, 2), 8, (12,) + S12, (24, 7))     # Lidl Auriol AHFL 433B2
+proto("ESPERANZA", 1, (42, 42), 2, F_CH1 | F_HSWAP, 2, crc_digest(0x3, 4, 32), (36, 36, 4),
+      (0, 2, 0), (0, 8), (10, 2), 33, (12, T_LE | T_F, 122), (24, 8))   # + Kedsum, Conrad S3318P
+proto("INFACTORY", 1, (40, 42), 0, F_HBCD | F_HREJ | F_CHNZ, 2, crc_digest(0x3, 4, 32, sub=2), (36, 8, 4),
+      None, (0, 8), (38, 2), 13, (16,) + F900, (28, 8))            # + nor-tec, FreeTec NC-3982;
+                                                                   # its CRC-4 0x13 is 0x3 in 4 bits
+proto("GT-WT-02", 1, (37, 37), 0, F_CH1, 1, NIBBLE_SUM, (31, 31, 6),
+      None, (0, 8), (10, 2), 8, (12,) + S12, (24, 7))              # Aldi Globaltronics
+proto("GT-WT-02", 1, (39, 39), 2, F_CH1, 1, NIBBLE_SUM, (31, 31, 6),
+      None, (0, 8), (10, 2), 8, (12,) + S12, (24, 7))              # Lidl AURIO YJ-T12: 2 extra bits
+proto("PROLOGUE", 1, (36, 37), 0, F_CH1 | F_BATOK, 2, NOCHECK, (0, 0, 0),
+      (2, 2, 0x1), (4, 8), (14, 2), 12, (16,) + S12, (28, 8))      # type 9/5; + ThermoPro TX2
+# PPM 576/1536
+proto("AUR-AFW2", 2, (36, 37), 0, F_CH1 | F_BATOK | F_HREJ, 2, NOCHECK, (0, 0, 0),
+      (24, 4, 0xA), (0, 8), (10, 2), 8, (12,) + S12, (28, 8))      # Lidl Auriol AFW 2 A1
+# PWM
+proto("TX141TH", 3, (40, 41), 0, F_HREJ, 1, lfsr_digest(0x31, 0xF4, 32), (32, 32, 8),
+      None, (0, 8), (10, 2), 8, (12, 0, 50), (24, 8))              # La Crosse TX141TH-Bv2, TFA 30.3221
+proto("BRESSER", 4, (40, 42), 0, F_HREJ | F_CHNZ, 1, BYTE_SUM, (32, 32, 8),
+      None, (0, 8), (10, 2), 8, (12,) + F900, (24, 8))             # Bresser 3CH, Renkforce DM-7511
+proto("AUR-HG02", 5, (40, 40), 0, F_CH1, 1, crc_digest(0x31, 8, 8, 0x53, per8=True), (32, 32, 8),
+      None, (0, 8), (18, 2), 16, (20,) + S12, (8, 8))              # Lidl Auriol HG02832 / HG05124A
+proto("EMOS", 6, (120, 120), 0, F_CH1 | F_BATOK, 1, BYTE_SUM, (104, 104, 8),
+      (0, 16, 0xAAA5), (24, 8), (66, 2), 101, (68,) + S12, (80, 8))   # EMOS E6016 / E6018
+proto("LACROSSE", 7, (44, 44), 0, 0, 1, NIBBLE_SUM, (40, 40, 4),
+      (0, 12, 0x0A0), (12, 7), (0, 0), 0, (20, T_DEC, 50), (0, 0))      # La Crosse TX3/TX4/TX6U/TX7U: temperature
 
 assert len(P) <= 16
-fam_blob = b"".join(struct.pack("<8B", kind, thr, gap, sync, glitch, pulse, pmax, 0)
-                    for (_, kind, thr, gap, sync, glitch, pulse, pmax) in FAMILIES)
+
+# ---- self-check of the digest constants -----------------------------------------
+# The CRCs and the LFSR digest as their sources define them, against the
+# digest loop of check() in temp433_app.c, on fixed pseudo-random frames.
+def _bits(frame):
+    return [(frame[i >> 3] >> (7 - (i & 7))) & 1 for i in range(8 * len(frame))]
+
+def _digest(check, c, b, skip):
+    """the C_DIGEST loop of check() in temp433_app.c"""
+    _, key0, x, gi, cfl = check
+    c1, cpos, cw = c
+    key = key0
+    for pos in range(c1):
+        q = 36 + (pos & 3) if (pos >> 2) == (cfl >> 4) else pos
+        if b[skip + q]:
+            x ^= key
+        key = (key >> 1) ^ gi if key & 1 else key >> 1
+        if (cfl & 1) and (pos & 7) == 7:
+            key = key0
+    v = 0
+    for i in range(cw):
+        v = v << 1 | b[skip + cpos + i]
+    return (x & ((1 << cw) - 1)) == v
+
+def _crc(msg, poly, init, w):
+    r = init << (8 - w)
+    p = (poly << (8 - w)) & 0xFF
+    for byte in msg:
+        r ^= byte
+        for _ in range(8):
+            r = ((r << 1) ^ p) & 0xFF if r & 0x80 else (r << 1) & 0xFF
+    return r >> (8 - w)
+
+def _lfsr_reflect(msg, gen, key):
+    s = 0
+    for byte in reversed(msg):
+        for i in range(8):
+            if (byte >> i) & 1:
+                s ^= key
+            key = ((key << 1) ^ gen) & 0xFF if key & 0x80 else (key << 1) & 0xFF
+    return s
+
+seed = 0x1234567
+for _ in range(64):
+    m = []
+    for _ in range(6):
+        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+        m.append(seed >> 16 & 0xFF)
+    for name, fam, _, skip, _, _, check, c, *_ in P:
+        if check[0] != C_DIGEST:
+            continue
+        f = list(m)
+        if name == "RUBICSON":
+            f[3] = (f[3] & 0xF0) | _crc([f[0], f[1], f[2], f[3] & 0xF0], 0x31, 0x6C, 8) >> 4
+            f[4] = (_crc([f[0], f[1], f[2], f[3] & 0xF0], 0x31, 0x6C, 8) & 0xF) << 4 | (f[4] & 0xF)
+        elif name == "ESPERANZA":         # 2 leading bits, then 40: the CRC ^ nibble 32 = nibble 36
+            d = [(f[k] << 2 | f[k + 1] >> 6) & 0xFF for k in range(4)]
+            nib = (_crc(d, 0x3, 0, 4) ^ (f[4] >> 2 & 0xF)) & 0xF
+            f[4] = (f[4] & 0xFC) | nib >> 2
+            f[5] = (f[5] & 0x3F) | (nib & 3) << 6
+        elif name == "INFACTORY":         # nibble 2 := channel nibble 9, CRC ^ nibble 8 = nibble 2
+            mm = [f[0], (f[1] & 0x0F) | (f[4] & 0x0F) << 4, f[2], f[3]]
+            f[1] = (f[1] & 0x0F) | ((_crc(mm, 0x3, 0, 4) ^ (f[4] >> 4)) & 0xF) << 4
+        elif name == "TX141TH":
+            f[4] = _lfsr_reflect(f[:4], 0x31, 0xF4)
+        elif name == "AUR-HG02":
+            f[4] = _crc([f[0] ^ f[1] ^ f[2] ^ f[3]], 0x31, 0x53, 8)
+        assert _digest(check, c, _bits(f), skip), name
+        f[2] ^= 0x10                      # one bit off: the check must fail
+        assert not _digest(check, c, _bits(f), skip), name
+
+fam_blob = b"".join(struct.pack("<8B", kind, thr, brk, end, glitch, pulse, pmax, 0)
+                    for (_, kind, thr, brk, end, glitch, pulse, pmax) in FAMILIES)
 proto_blob = b""
-for (name, fam, (bmin, bmax), skip, flags, check, (c1, c2, c3), reps, fixed, ident, ch, bat, temp, hum) in P:
+for (name, fam, (bmin, bmax), skip, flags, reps, (ck, ca, cb, cc, cfl), (c1, cpos, cw), fixed, ident, ch, bat,
+     (tpos, tfl, toff), hum) in P:
     fp, fl, fv = fixed or (0, 0, 0)
-    assert all(0 <= v < 256 for v in (bmin, bmax, skip, c1, c2, c3, fp, fl, bat)) and bmax <= 127 and fl <= 16
-    proto_blob += struct.pack("<24B", fam, bmin, bmax, skip, flags, check, c1, c2, c3, reps,
-                              fp, fl, fv >> 8, fv & 0xFF, ident[0], ident[1], ch[0], ch[1], bat,
-                              temp[0], temp[1], hum[0], hum[1], 0)
+    assert all(0 <= v < 256 for v in (bmin, bmax, skip, ca, cb, cc, cfl, c1, cpos, cw, fp, fl, bat, toff))
+    assert bmax <= 127 and fl <= 16 and cw <= 8 and len(name) <= 9
+    proto_blob += struct.pack("<32B", fam, bmin, bmax, skip, flags, reps,
+                              ck, c1, cpos, cw, ca, cb, cc, cfl,
+                              fp, fl, fv >> 8, fv & 0xFF,
+                              ident[0], ident[1], ch[0], ch[1], bat,
+                              tpos, tfl, toff, hum[0], hum[1], 0, 0, 0, 0)
 
 a = Assets("TEMP433")
 ui_size = 0
@@ -151,11 +275,10 @@ a.raw("FAMS", fam_blob)
 a.const("FAM_SIZE", 8)
 a.const("FAM_COUNT", len(FAMILIES))
 a.raw("PROTOS", proto_blob)
-a.const("PROTO_SIZE", 24)
+a.const("PROTO_SIZE", 32)
 a.const("PROTO_COUNT", len(P))
-if not DIAG:
-    a.raw("BMP_BARS", b"".join(bytes(v) for v in BARS))
-    a.const("BARS_W", len(BARS[0]))
-    a.raw("BMP_TAIL", tails)
-    a.const("TAIL_W", 18)
+a.raw("BMP_BARS", b"".join(bytes(v) for v in BARS))
+a.const("BARS_W", len(BARS[0]))
+a.raw("BMP_TAIL", tails)
+a.const("TAIL_W", 18)
 a.main()

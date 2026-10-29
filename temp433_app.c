@@ -17,7 +17,7 @@
 /*
  * Temp 433 - 433 MHz wireless temperature sensors, receive only: no tx_*
  * service of the API is called and REG_33 (RF path, PA enable) is never
- * written.  Work in progress: the receiver, 4 protocols and the sensor table.
+ * written.  Work in progress: the receiver, 14 decoders and the sensor table.
  *
  * Receiver: the BK4829 in AM with the RX filters bypassed (RAW), AFC off, the
  * widest RF filter and a fixed gain, so the RX audio on PA4 is the envelope of
@@ -29,20 +29,22 @@
  * Started on 433.80-434.04 the app is in AUTO, anywhere else in VFO; on VHF
  * (the VFO's RF path, REG_33 untouched) it only says so.  Every frequency
  * keeps its own noise floor (RSSI, mean); a reading the sensitivity above it
- * stops the sweep on the strongest of that frequency and its neighbours, and
- * PA4 is sampled (20 kHz) into runs of on/off levels until the audio goes
- * quiet.  The runs are demodulated per timing family into rows and matched
- * against the protocol table of the assets.  A capture that held no bits
- * moves the noise floor of its frequency halfway to the level that started
- * it, so a steady carrier stops triggering after a few tries.
+ * stops the sweep there (or on a neighbour clearly stronger), and PA4 is
+ * sampled (20 kHz) into runs of on/off levels until the audio goes
+ * quiet.  The runs are demodulated per timing family (PPM: the gap is the
+ * bit, PWM: the pulse is) into rows and matched against the protocol table of
+ * the assets.  A capture that held no bits moves the noise floor of its
+ * frequency halfway to the level that started it, so a steady carrier stops
+ * triggering after a few tries.
  *
- * Keys: UP/DOWN select a sensor, 1 speaker, 2 clear the table and the
+ * Decoders: one table record per protocol, no code of its own.  The checks
+ * are two loops: a sum of 4- or 8-bit units, and a linear digest that covers
+ * every CRC and LFSR check of the table (see check()); the temperature and
+ * humidity encodings are flags.
+ *
+ * Keys: UP/DOWN scroll the table, 1 speaker, 2 clear the table and the
  * counters, 3 sensitivity (High 6 dB, Normal 10 dB, Low 15 dB above the
- * noise), 5 AUTO / VFO, EXIT quit.  The DIAG build (measurements) keeps the
- * diagnostic screen of stage 1, centres AUTO on the VFO, and every capture goes to
- * the USB-C serial port for the analysis on a PC (the first unrecognised one
- * since the counters were cleared, heard without a cable, follows once one
- * is plugged in).
+ * noise), 5 AUTO / VFO, EXIT quit.
  */
 
 #include <stdint.h>
@@ -95,22 +97,36 @@
 #define ROWS        16u
 #define ROW_BYTES   16u                /* 128 bits                                   */
 #define MIN_ROW     16u                /* bits: a shorter row is noise               */
-enum { C_NONE, C_NIBSUM, C_CRC8 };
-enum { T_S12 = 1 };
+enum { C_NONE, C_SUM, C_DIGEST };
 enum { EMPTY, PACKET, DECODED };
-#define F_CH1       1u
-#define F_BATOK     2u
+#define F_CH1       1u                 /* flags: the channel is shown +1             */
+#define F_BATOK     2u                 /* the battery bit is 1 when OK (else when low) */
+#define F_HSWAP     4u                 /* humidity with its nibbles swapped          */
+#define F_HBCD      8u                 /* humidity in BCD                            */
+#define F_HREJ      16u                /* a humidity over 100 % rejects the frame    */
+#define F_CHNZ      32u                /* channel 0 rejects the frame                */
+#define T_SIGNED    1u                 /* t_fl: 12-bit two's complement, 0.1 C       */
+#define T_LE        2u                 /* the three nibbles last to first            */
+#define T_DEC       4u                 /* three decimal digits                       */
+#define T_F         8u                 /* 0.1 F, t_off x 10 below 32 F               */
 #define NO_HUM      0xFFu
 #define NO_READING  0xFFu
 
-typedef struct {                       /* FAMS record of the assets (8 B)   */
-    uint8_t kind, thr, row_gap, sync, glitch, pulse, pmax, pad;   /* kind, sync: PWM (stage 3) */
+typedef struct {                       /* FAMS record of the assets (8 B)            */
+    uint8_t kind;                      /* 0 PPM, 1 PWM (long pulse 1), 3 PWM (short pulse 1) */
+    uint8_t thr, brk, end;             /* bit threshold; a longer bit run ends the row (PPM: */
+                                       /* a gap, PWM: a sync pulse); PWM: so does a  */
+                                       /* gap longer than end, after its bit         */
+    uint8_t glitch, pulse, pmax, pad;  /* PPM: a pulse longer than pmax is pulse plus noise */
 } fam_t;
 
-typedef struct {                       /* PROTOS record of the assets (24 B) */
-    uint8_t fam, bmin, bmax, skip, flags, check, c1, c2, c3, reps;
-    uint8_t fix_pos, fix_len, fix_hi, fix_lo;
-    uint8_t id_pos, id_len, ch_pos, ch_len, bat, t_pos, t_enc, h_pos, h_len, pad;
+typedef struct {                       /* PROTOS record of the assets (32 B)         */
+    uint8_t fam, bmin, bmax, skip, flags, reps;
+    uint8_t check, c1, cpos, cw, ca, cb, cc, cfl;      /* see check()               */
+    uint8_t fix_pos, fix_len, fix_hi, fix_lo;          /* from the row start         */
+    uint8_t id_pos, id_len, ch_pos, ch_len, bat;
+    uint8_t t_pos, t_fl, t_off, h_pos, h_len;
+    uint8_t pad[4];
 } proto_t;
 
 typedef struct {
@@ -119,46 +135,33 @@ typedef struct {
 } rows_t;
 
 typedef struct {                       /* a reading, and a row of the sensor table  */
-    uint8_t proto, id, ch, low, hum, rssi;                  /* rssi: dBm + 160       */
+    uint8_t proto, id, ch, low, hum;
     int16_t t10;                       /* 0.1 C                                     */
-    uint16_t count;                    /* readings of this sensor (table)           */
-    uint32_t seen, f;                  /* ticks_ms of the last one, its frequency   */
+    uint32_t seen;                     /* ticks_ms of the last one                  */
 } sensor_t;
 
-/* ---- screen (release build) ---- */
+/* ---- screen ---- */
 #define N_SENS      12u                /* sensors kept; a new one replaces the one  */
                                        /* heard longest ago                         */
 #define ROWS_SHOWN  6u                 /* table rows, frame buffer lines 0-5        */
 
 static const uint8_t THR_DB[3] = { 6, 10, 15 };            /* dB above the noise floor */
-#ifdef DIAG
-static const uint8_t SENS_T[3] = { T_HIGH, T_NORMAL, T_LOW };
-#endif
 
 /* All the state in one struct (one base address for Thumb-1 code), the byte
  * fields first so their offsets fit ldrb's immediate.  The loader zeroes the
  * overlay at every launch. */
 static struct {
     uint8_t running, prev, saver, sens, spk, vhf, is_auto, pt, nrows, off, skip, hold_pt, led, aborted, pkt;
-#ifdef DIAG
-    uint8_t seq;                       /* captures sent to the serial port          */
-#else
-    uint8_t n, sel, top;               /* table: sensors, selected, first shown     */
-#endif
+    uint8_t n, top;                    /* table: sensors, first one shown           */
     sensor_t r;                        /* the reading match() decodes               */
-    uint16_t reg2b, ctrl, cap, stops, empties, packets, ok;
-    uint32_t vfo, f0, t0, armed, hold_until, led_until, next_draw, empty_smp;
-#ifndef DIAG
+    uint16_t reg2b, ctrl, packets, ok;
+    uint32_t vfo, f0, armed, hold_until, led_until, next_draw;
     sensor_t *tab;                     /* [N_SENS] on app_main's stack              */
-#endif
     const app_api_t *api;
     uint8_t *runs;                     /* [MAX_RUNS] on app_main's stack            */
     rows_t *rows;                      /* on app_main's stack                       */
     uint16_t *floorq;                  /* [N_PTS] noise floor, (dBm + 160) x 256    */
     const uint8_t *row;                /* the row being matched                     */
-#ifdef DIAG
-    uint8_t *keep;                     /* [FRAME] on app_main's stack               */
-#endif
 } g;
 #define A (g.api)
 
@@ -188,17 +191,11 @@ static void asset(uint16_t offset, void *buf, uint16_t len)
 
 /* ---- text ------------------------------------------------------------------ */
 
-/* The resident formatters: one local stub each keeps every call a plain bl. */
+/* The resident formatter: one local stub keeps every call a plain bl. */
 __attribute__((noinline))
 static char *putu(char *o, uint32_t v)
 {
     return A->append_u32(o, v);
-}
-
-__attribute__((noinline))
-static char *puti(char *o, int32_t v)
-{
-    return A->append_i32(o, v);
 }
 
 static char *put(char *o, const char *s)
@@ -354,14 +351,14 @@ static uint16_t capture(void)
     }
     if (level < 2u)
         runs[n++] = (uint8_t)(len > 255u ? 255u : len);   /* the silence after the burst */
-    g.cap = k;
 
     /* the carrier off is the parity with the longer total (PPM pulses take
      * about a quarter of the time), the first and the last run left out: the
      * level after the burst is unreliable (the AC-coupled detector drifts,
      * noise).  Not the longest run: on the radio the comparator once settled
      * on the first one (108 20 60 39, then 10 / 20 / 40 / 80), and noise once
-     * stretched a pulse to 99 samples, past the 80-sample sync gap */
+     * stretched a pulse to 99 samples, past the 80-sample sync gap.  PWM
+     * pulses and gaps take about as long, so decode() tries both there */
     int32_t d = 0;                      /* runs[n-2] - runs[n-3] + ... +- runs[1] */
     for (uint16_t i = 1; i + 1u < n; i++)
         d = (int32_t)runs[i] - d;
@@ -382,34 +379,41 @@ static void row_end(void)
         g.nrows++;
 }
 
-/* PPM: the gap after a pulse is the bit, a long gap ends the row */
-static void emit(const fam_t *f, uint16_t gap)
+/* one bit: PPM from the gap after the pulse, PWM from the pulse (kind 3: a
+ * short pulse is 1).  A bit run longer than brk (PPM: a gap, PWM: a sync
+ * pulse) ends the row instead; in PWM a gap longer than end ends it after the
+ * bit (PPM: end 255, past every gap that gets here) */
+static void emit(const fam_t *f, uint16_t pulse, uint16_t gap)
 {
     rows_t *const r = g.rows;
-    if (gap > f->row_gap) {
+    const uint16_t v = f->kind ? pulse : gap;
+    if (v > f->brk) {
         row_end();
         return;
     }
     const uint8_t n = r->bits[g.nrows];
     if (n < ROW_BYTES * 8u) {
-        if (gap > f->thr)
+        if ((v > f->thr) ^ (f->kind >> 1))
             r->bytes[g.nrows][n >> 3] |= (uint8_t)(0x80u >> (n & 7u));
         r->bits[g.nrows] = (uint8_t)(n + 1u);
     }
+    if (gap > f->end)
+        row_end();
 }
 
-/* runs -> rows for one family; a pulse shorter than the glitch length is merged
- * into the gap around it, a gap that short into the pulses around it.  A
- * pulse longer than pmax is the real one plus noise that switched the
- * comparator on early, so the excess goes back to the gap before it (weak
- * packets otherwise turn a 1 bit into a 0). */
-static void demod(const fam_t *f, uint16_t n)
+/* runs -> rows for one family, the carrier off on the runs of parity off; a
+ * pulse shorter than the glitch length is merged into the gap around it, a
+ * gap that short into the pulses around it.  A PPM pulse longer than pmax is
+ * the real one plus noise that switched the comparator on early, so the
+ * excess goes back to the gap before it (weak packets otherwise turn a 1 bit
+ * into a 0; PWM: pmax 255, off). */
+static void demod(const fam_t *f, uint16_t n, uint8_t off)
 {
     const uint8_t *const runs = g.runs;
     memset(g.rows, 0, sizeof(rows_t));
     g.nrows = 0;
     uint16_t pulse = 0, gap = 0;
-    for (uint16_t i = (uint16_t)(g.off ? 0u : 1u); i < n; i = (uint16_t)(i + 2u)) {
+    for (uint16_t i = (uint16_t)(off ? 0u : 1u); i < n; i = (uint16_t)(i + 2u)) {
         uint16_t p = runs[i];
         const uint16_t q = i + 1u < n ? runs[i + 1u] : 255u;
         if (p > f->pmax) {
@@ -426,12 +430,12 @@ static void demod(const fam_t *f, uint16_t n)
             continue;
         }
         if (pulse)
-            emit(f, gap);
+            emit(f, pulse, gap);
         pulse = p;
         gap = q;
     }
     if (pulse)
-        emit(f, gap);
+        emit(f, pulse, gap);
     row_end();
 }
 
@@ -449,57 +453,82 @@ static uint16_t bits(uint8_t pos, uint8_t len)
     return v;
 }
 
-static uint8_t crc8(uint8_t rem, uint8_t b, uint8_t poly)
-{
-    rem ^= b;
-    for (uint8_t i = 0; i < 8u; i++)
-        rem = (uint8_t)(rem & 0x80u ? (rem << 1) ^ poly : rem << 1);
-    return rem;
-}
-
-/* noinline here and on decode(), grab(), put_t10(), rput(), draw() and keys():
- * GCC 13.3 -Os makes the whole smaller with them out of line (each measured
- * on both builds; inlined into app_main they cost ~150 B more in all) */
+/* noinline here and on temperature(), grab(), put_t10(), rput(), draw() and
+ * keys(): GCC 13.3 -Os makes the whole smaller with them out of line, and
+ * decode() inline (each measured on the build; GCC's choices shift with every
+ * change, so measure again after a bigger one) */
 __attribute__((noinline))
 static bool check(const proto_t *p)
 {
     const uint8_t c1 = p->c1;
-    switch (p->check) {
-    case C_NIBSUM: {                    /* sum of the nibbles of c1 bits, c2 bits of it */
-        uint16_t sum = 0;
-        for (uint8_t pos = 0; pos < c1; pos = (uint8_t)(pos + 4u)) {
-            const uint8_t rest = (uint8_t)(c1 - pos), len = rest < 4u ? rest : 4u;
-            sum = (uint16_t)(sum + (bits(pos, len) << (4u - len)));
+    uint16_t x = p->cb;
+    if (p->check == C_SUM) {
+        /* cb plus the ca-bit units (4 or 8) of the first c1 bits, the last
+         * one zero padded: the nibble and byte sums */
+        const uint8_t w = p->ca;
+        for (uint8_t pos = 0; pos < c1; pos = (uint8_t)(pos + w)) {
+            const uint8_t rest = (uint8_t)(c1 - pos), len = rest < w ? rest : w;
+            x = (uint16_t)(x + (bits(pos, len) << (w - len)));
         }
-        return (sum & ((1u << p->c2) - 1u)) == bits(c1, p->c2);
-    }
-    case C_CRC8: {                      /* CRC-8 of c1 bits (zero padded) = the next byte */
-        uint8_t x = p->c3;
-        for (uint8_t pos = 0; pos < c1; pos = (uint8_t)(pos + 8u)) {
-            const uint8_t rest = (uint8_t)(c1 - pos), len = rest < 8u ? rest : 8u;
-            x = crc8(x, (uint8_t)(bits(pos, len) << (8u - len)), p->c2);
+        if (!x)                         /* all zero: a frame of another timing read */
+            return false;               /* in this one (rtl_433 drops it too) */
+    } else if (p->check == C_DIGEST) {
+        /* A CRC with no final XOR is linear: the CRC of a message is the one
+         * of its init XOR, for every 1 bit, the CRC that bit alone leaves,
+         * and those follow each other like an LFSR stepped backwards.  So one
+         * loop does them all: x from cb, x ^= key for every 1 of the first
+         * c1 bits, the key one step back after each (cc: the polynomial
+         * shifted for that).  gen_assets.py derives cb, ca and cc from the
+         * CRC (or LFSR digest) as its source defines it.  cfl bit 0: the
+         * key starts over every 8 bits (a CRC of the XOR of the bytes);
+         * cfl >> 4: that nibble is read from bits 36-39 (inFactory) */
+        uint8_t key = p->ca;
+        for (uint8_t pos = 0; pos < c1; pos++) {
+            uint8_t q = pos;
+            if ((pos >> 2) == (p->cfl >> 4))
+                q = (uint8_t)(36u + (pos & 3u));
+            if (bits(q, 1))
+                x ^= key;
+            key = (uint8_t)(key & 1u ? (key >> 1) ^ p->cc : key >> 1);
+            if ((p->cfl & 1u) && (pos & 7u) == 7u)
+                key = p->ca;
         }
-        return x == bits(c1, 8);
+    } else {
+        return true;                    /* C_NONE: the repeats decide */
     }
-    default:                            /* C_NONE: the repeats decide */
-        return true;
-    }
+    return (x & ((1u << p->cw) - 1u)) == bits(p->cpos, p->cw);
 }
 
-/* T_S12 only so far: 12-bit two's complement, 0.1 C */
+/* 0.1 C from 12 bits: two's complement, or t_off x 10 below 0 C (0.1 C) or
+ * below 32 F (0.1 F) */
+__attribute__((noinline))
 static int16_t temperature(const proto_t *p)
 {
-    int16_t t = (int16_t)bits(p->t_pos, 12);
-    return (int16_t)(t & 0x800 ? t - 4096 : t);
+    const uint8_t fl = p->t_fl;
+    uint16_t t = bits(p->t_pos, 12);
+    if (fl & T_LE)
+        t = (uint16_t)((t >> 8) | (t & 0xF0u) | (t & 0xFu) << 8);
+    if (fl & T_DEC)
+        t = (uint16_t)((t >> 8) * 100u + ((t >> 4) & 15u) * 10u + (t & 15u));
+    if (fl & T_SIGNED)
+        return (int16_t)((int16_t)(t << 4) >> 4);
+    t = (uint16_t)(t - p->t_off * 10u);
+    if (fl & T_F)                       /* rounded, from -40 F (-720) up */
+        t = (uint16_t)(((uint16_t)(t + 720u) * 5u + 4u) / 9u - 400u);
+    return (int16_t)t;
 }
 
-/* h_len bits (0: none), 1-100 % */
+/* h_len bits (0: none), in % (over 100: no humidity, or a bad BCD digit) */
 static uint8_t humidity(const proto_t *p)
 {
     if (!p->h_len)
-        return NO_HUM;
-    const uint8_t h = (uint8_t)bits(p->h_pos, p->h_len);
-    return h && h <= 100u ? h : NO_HUM;
+        return 0;
+    uint8_t h = (uint8_t)bits(p->h_pos, p->h_len);
+    if (p->flags & F_HSWAP)
+        h = (uint8_t)(h << 4 | h >> 4);
+    if (p->flags & F_HBCD)
+        h = (h & 15u) > 9u ? 0xFFu : (uint8_t)((h >> 4) * 10u + (h & 15u));
+    return h;
 }
 
 /* identical rows to row r (itself included) */
@@ -531,19 +560,24 @@ static bool match(uint8_t f)
             if (n < p.bmin || n > p.bmax)
                 continue;
             g.row = g.rows->bytes[r];
-            g.skip = p.skip;
+            g.skip = 0;                 /* the fixed bits count from the row start */
             if (p.fix_len && bits(p.fix_pos, p.fix_len) != (uint16_t)(p.fix_hi << 8 | p.fix_lo))
                 continue;
+            g.skip = p.skip;
             if (!check(&p) || same(r) < p.reps)
                 continue;
+            /* the sanity checks of the rtl_433 decoders: a frame shifted by
+             * a noise bit can pass a 4-bit check, and repeats as often */
             const int16_t t = temperature(&p);
-            if (t < -400 || t > 700)
+            const uint8_t h = humidity(&p);
+            const uint8_t ch = (uint8_t)(p.ch_len ? bits(p.ch_pos, p.ch_len) : 0u);
+            if (t < -400 || t > 700 || ((p.flags & F_HREJ) && h > 100u) || ((p.flags & F_CHNZ) && !ch))
                 continue;
             g.r.proto = i;
             g.r.id = (uint8_t)bits(p.id_pos, p.id_len);
-            g.r.ch = (uint8_t)(p.ch_len ? bits(p.ch_pos, p.ch_len) + (p.flags & F_CH1) : 0u);
+            g.r.ch = (uint8_t)(ch + (p.flags & F_CH1));
             g.r.t10 = t;
-            g.r.hum = humidity(&p);
+            g.r.hum = h && h <= 100u ? h : NO_HUM;
             g.r.low = (uint8_t)(bits(p.bat, 1) ^ ((p.flags & F_BATOK) ? 1u : 0u));
             return true;
         }
@@ -551,68 +585,24 @@ static bool match(uint8_t f)
     return false;
 }
 
-__attribute__((noinline))
 static uint8_t decode(uint16_t n)
 {
     fam_t f;
     g.pkt = EMPTY;
     for (uint8_t i = 0; i < FAM_COUNT; i++) {
         asset((uint16_t)(FAMS + i * FAM_SIZE), &f, FAM_SIZE);
-        demod(&f, n);
-        if (match(i))
-            return DECODED;
+        /* PWM: either parity (see capture()) */
+        for (uint8_t k = 0; k <= (f.kind ? 1u : 0u); k++) {
+            demod(&f, n, (uint8_t)(g.off ^ k));
+            if (match(i))
+                return DECODED;
+        }
     }
     return g.pkt;
 }
 
-#ifdef DIAG
-/* DIAG: every capture to the USB serial port: a 12-byte header 'T' '4', seq,
- * result, level and noise floor (dBm + 160), protocol (0xFF: none),
- * carrier-off parity, runs (u16 LE), samples (u16 LE), then the runs; in
- * 64-byte writes, as the F4HWN KISS TNC app sends.  The USB cable brings the
- * PC's noise into the receiver (-80 dBm measured), so weak packets are heard
- * without it: the first packet no protocol took since the counters were
- * cleared waits in RAM and follows the first capture a host reads.  Not the
- * last one: plugging the cable in brings a burst of noise packets.  Only one
- * (the stack keeps ~1.4 KB free); keep[0] is 'T' while it waits. */
-#define FRAME       (12u + MAX_RUNS)
-
-/* false when no host took them */
-static bool send(const uint8_t *h, const uint8_t *runs, uint16_t n)
-{
-    bool (*const write)(uint8_t, const void *, uint16_t) = A->serial_write;
-    if (!write(APP_SERIAL_USB, h, 12u))
-        return false;
-    for (uint16_t i = 0; i < n; i = (uint16_t)(i + 64u)) {
-        const uint16_t left = (uint16_t)(n - i);
-        if (!write(APP_SERIAL_USB, runs + i, left < 64u ? left : 64u))
-            return false;
-    }
-    return true;
-}
-
-static void dump(uint8_t res, uint8_t level, uint8_t pt, uint16_t n)
-{
-    const uint8_t h[12] = { 'T', '4', g.seq++, res, level, (uint8_t)((g.floorq[pt] + 128u) >> 8),
-                            res == DECODED ? g.r.proto : 0xFFu, g.off,
-                            (uint8_t)n, (uint8_t)(n >> 8), (uint8_t)g.cap, (uint8_t)(g.cap >> 8) };
-    if (send(h, g.runs, n)) {
-        uint8_t *const f = g.keep;
-        if (f[0] && send(f, f + 12, (uint16_t)(f[8] | f[9] << 8)))
-            f[0] = 0;
-        return;
-    }
-    if (res != PACKET || g.keep[0])
-        return;
-    uint8_t *const f = g.keep;
-    for (uint16_t i = 0; i < 12u + n; i++)
-        f[i] = i < 12u ? h[i] : g.runs[i - 12u];
-}
-#endif
-
 /* ---- search ----------------------------------------------------------------- */
 
-#ifndef DIAG
 /* the reading in g.r into the table: the same sensor (protocol, ID, channel)
  * is updated in place, a new one goes at the end (the order they were first
  * heard in); a full table first drops the sensor heard longest ago */
@@ -626,64 +616,53 @@ static void store(void)
         if ((int32_t)(t[i].seen - t[old].seen) < 0)
             old = i;
     }
-    uint16_t count = 1;
-    if (i < g.n) {
-        count = (uint16_t)(t[i].count + 1u);
-    } else if (i == N_SENS) {
+    if (i == N_SENS) {
         for (i = old; i + 1u < N_SENS; i++)
             t[i] = t[i + 1u];
-    } else {
+    } else if (i == g.n) {
         g.n++;
     }
     t[i] = g.r;
-    t[i].count = count;
 }
-#endif
 
-/* point p (level v) went over the threshold */
+/* point p (level v) went over the threshold.  AUTO: a strong sensor ~20 kHz
+ * away also reaches the frequent centre through the filter skirt, and a
+ * capture there misses it (PWM above all), so a neighbour at least 6 dB
+ * stronger takes the capture.  Not merely the stronger one (up to stage 2):
+ * a single reading of a weak packet is noise, and the moves off its
+ * frequency lost it (emulator, inFactory 7 dB above the noise in AUTO: 3 of
+ * 10 read, now 10 of 10). */
 __attribute__((noinline))
 static void grab(uint8_t p, uint8_t v)
 {
-    uint8_t best = p, bv = v;
-    if (g.is_auto) {                    /* the wide filter also sees the next points */
+    uint8_t q = p, lv = v;              /* the capture point and its level */
+    if (g.is_auto) {
         for (uint8_t k = (uint8_t)(p - 1u); k != (uint8_t)(p + 3u); k = (uint8_t)(k + 2u)) {
             if (k >= N_PTS)
                 continue;
             go(k);
             const uint8_t w = measure();
-            if (w > bv) {
-                best = k;
-                bv = w;
+            if (w >= lv + 6u) {
+                q = k;
+                lv = w;
             }
         }
-        go(best);
+        go(q);
     }
-    g.stops++;
     const uint16_t n = capture();
     const uint8_t res = decode(n);
-#ifdef DIAG
-    dump(res, bv, best, n);
-#endif
     const uint32_t now = A->ticks_ms();
-    if (res == EMPTY && !g.aborted) {   /* a steady carrier joins the noise */
-        g.empties++;
-        g.empty_smp += g.cap;
-        learn(p, v, 1);
-        if (best != p)
-            learn(best, bv, 1);
+    if (res == EMPTY && !g.aborted) {   /* a steady carrier joins the noise of */
+        learn(p, v, 1);                 /* the point it set off */
     } else {
         g.packets++;
-        g.hold_pt = best;
+        g.hold_pt = q;
         g.hold_until = now + HOLD_MS;
     }
     if (res == DECODED) {
         g.ok++;
-        g.r.f = freq(best);
-        g.r.rssi = bv;
         g.r.seen = now;
-#ifndef DIAG
         store();
-#endif
         A->backlight_on();
         A->led(true);
         g.led = 1;
@@ -735,30 +714,22 @@ static void scan(void)
     }
 }
 
-/* the counters start over with what is measured */
+/* the packet counts start over */
 static void reset(void)
 {
-    g.stops = g.empties = g.packets = g.ok = 0;
-    g.empty_smp = 0;
-    g.t0 = A->ticks_ms();
-#ifdef DIAG
-    g.keep[0] = 0;                     /* the next unrecognised packet is kept */
-#endif
+    g.packets = g.ok = 0;
 }
 
 /* mode or frequency changed: the noise floor is learned again */
 static void retune(void)
 {
-#ifdef DIAG
-    g.f0 = g.is_auto ? g.vfo - CENTER * F_STEP : g.vfo;
-#else
     g.f0 = g.is_auto ? F_FIRST : g.vfo;
-#endif
     memset(g.floorq, 0, N_PTS * sizeof(uint16_t));
     g.pt = NO_PT;
     reset();
-    g.armed = g.t0 + LEARN_MS;
-    g.hold_until = g.t0;
+    const uint32_t now = A->ticks_ms();
+    g.armed = now + LEARN_MS;
+    g.hold_until = now;
 }
 
 /* ---- screen ----------------------------------------------------------------- */
@@ -791,73 +762,6 @@ static char *put_t10(char *o, int16_t t)
     return put_fixed(o, (uint32_t)t, 10u);
 }
 
-#ifdef DIAG
-__attribute__((noinline))
-static void draw(void)
-{
-    /* the UI texts in one asset read, word-aligned (gen_assets.py pads them) */
-    char s[UI_SIZE] __attribute__((aligned(4)));
-    char b[36], name[T_NAME_STRIDE];
-    char *o;
-    const app_api_t *const a = A;
-    asset(0, s, UI_SIZE);
-    a->display_clear();
-    a->status_clear();
-    a->print_inverse(s + T_TITLE, 2, 0, true, true, (uint8_t)(2u + T_TITLE_CHARS * 4u));
-    a->draw_battery();
-    if (g.vhf) {
-        a->print_tiny(s + T_VHF1, 0, 17, false, true);
-        a->print_tiny(s + T_VHF2, 0, 25, false, true);
-        return;
-    }
-
-    /* mode, range or frequency, sensitivity */
-    o = put_range(put(b, s + (g.is_auto ? T_AUTO : T_VFO)));
-    tiny(b, put(o, s + SENS_T[g.sens]), 1);
-
-    /* time, stops, empty stops and the share of the time they took */
-    const uint32_t now = a->ticks_ms(), el = now - g.t0;
-    o = put(putu(put(putu(put(b, s + T_T), (uint32_t)__aeabi_uidivmod(el, 1000u)), s + T_STOPS), g.stops), s + T_EMPTY);
-    o = putu(o, g.empties);
-    *o++ = ' ';
-    o = put_fixed(o, el ? (uint32_t)__aeabi_uidivmod(g.empty_smp * (1000u / (FS / 1000u)), el) : 0u, 10u);
-    *o++ = '%';
-    tiny(b, o, 9);
-
-    tiny(b, put_counts(putu(put(b, s + T_PACKETS), g.packets), s), 17);
-
-    /* noise floor of 433.92 (AUTO) or of the VFO frequency */
-    const uint16_t q = g.floorq[g.is_auto ? CENTER : 0u];
-    if (q)
-        tiny(b, put(puti(put(b, s + T_NOISE), (int32_t)((q + 128u) >> 8) - 160), s + T_DBM), 25);
-
-    /* the last reading */
-    if (g.r.proto == NO_READING) {
-        tiny(b, put(b, s + T_NONE), 33);
-        tiny(b, put(b, s + T_KEYS + 2), 49);
-        return;
-    }
-    asset((uint16_t)(T_NAME + g.r.proto * T_NAME_STRIDE), name, T_NAME_STRIDE);
-    o = putu(put(putu(put(put(b, name), s + T_ID), g.r.id), s + T_CH), g.r.ch);
-    if (g.r.low)
-        o = put(o, s + T_BAT);
-    tiny(b, o, 33);
-
-    o = put_t10(b, g.r.t10);
-    *o++ = 'C';
-    if (g.r.hum != NO_HUM) {
-        *o++ = ' ';
-        o = putu(o, g.r.hum);
-        *o++ = '%';
-    }
-    *o++ = ' ';
-    o = put_freq(o, g.r.f);
-    *o++ = ' ';
-    tiny(b, put(puti(o, (int32_t)g.r.rssi - 160), s + T_DBM), 41);
-
-    tiny(b, put(putu(put(b, s + T_AGE), (uint32_t)__aeabi_uidivmod(now - g.r.seen, 1000u)), s + T_KEYS), 49);
-}
-#else
 /* e - s right-aligned to end just before dst */
 __attribute__((noinline))
 static void rput(char *dst, const char *s, const char *e)
@@ -885,19 +789,16 @@ static char *put_age(char *o, uint32_t ms)
 }
 
 /* Status line: title, AUTO / VFO, sensitivity bars, speaker and scroll marks,
- * battery.  Lines 0-5: one sensor a row, in 32 columns of the 3x5 font:
- *   PROLOGUE 2  90  -3.7 55%  1m !
- *   model    ch id  temp hum  age low battery
- * the selected row inverted.  Line 6: a dotted line, then the selected
- * sensor's frequency, dBm and count (the range and the counts while the
- * table is empty). */
+ * battery.  Lines 0-5: one sensor a row, in the 32 columns of the 3x5 font:
+ *   INFACTORY 3 205  -7.3 100%  1m !
+ *   model     ch id  temp hum   age low battery
+ * Line 6: a dotted line, then the range (or the frequency) and the counts. */
 __attribute__((noinline))
 static void draw(void)
 {
     /* the UI texts in one asset read, word-aligned (gen_assets.py pads them) */
     char s[UI_SIZE] __attribute__((aligned(4)));
     char b[36], v[T_NAME_STRIDE > 8u ? T_NAME_STRIDE : 8u];
-    char *o;
     const app_api_t *const a = A;
     asset(0, s, UI_SIZE);
     a->display_clear();
@@ -923,42 +824,27 @@ static void draw(void)
     const uint32_t now = a->ticks_ms();
     const sensor_t *e = g.tab + g.top;
     for (uint8_t r = 0; r < ROWS_SHOWN && (uint8_t)(g.top + r) < g.n; r++, e++) {
-        memset(b, ' ', 31);
+        memset(b, ' ', 32);
         asset((uint16_t)(T_NAME + e->proto * T_NAME_STRIDE), v, T_NAME_STRIDE);
         put(b, v);
-        b[9] = (char)('0' + e->ch);
-        rput(b + 14, v, putu(v, e->id));
-        rput(b + 20, v, put_t10(v, e->t10));
+        b[10] = (char)('0' + e->ch);
+        rput(b + 15, v, putu(v, e->id));
+        rput(b + 21, v, put_t10(v, e->t10));
         if (e->hum == NO_HUM)
-            b[21] = b[22] = '-';
+            b[22] = b[23] = '-';
         else
-            *putu(b + 21, e->hum) = '%';
-        rput(b + 28, v, put_age(v, now - e->seen));
+            *putu(b + 22, e->hum) = '%';
+        rput(b + 30, v, put_age(v, now - e->seen));
         if (e->low)
-            b[30] = '!';
-        b[31] = 0;
+            b[31] = '!';
+        b[32] = 0;
         a->print_tiny(b, 0, (uint8_t)(r * 8u + 1u), false, true);
-        if ((uint8_t)(g.top + r) == g.sel)
-            for (unsigned x = 0; x < 128u; x++)
-                a->fb[r][x] ^= 0xFFu;
     }
 
     for (unsigned x = 0; x < 128u; x += 2u)
         a->fb[6][x] |= 0x01u;
-    if (g.n) {
-        e = g.tab + g.sel;
-        o = put_freq(b, e->f);
-        *o++ = ' ';
-        o = put(puti(o, (int32_t)e->rssi - 160), s + T_DBM);
-        *o++ = ' ';
-        *o++ = 'x';
-        o = putu(o, e->count);
-    } else {
-        o = put_counts(put_range(b), s);
-    }
-    tiny(b, o, 50);
+    tiny(b, put_counts(put_range(b), s), 50);
 }
-#endif
 
 /* ---- keys ------------------------------------------------------------------- */
 
@@ -992,11 +878,7 @@ static void keys(void)
         A->audio_path(g.spk);
         break;
     case APP_KEY_2:
-#ifdef DIAG
-        g.r.proto = NO_READING;
-#else
-        g.n = g.sel = g.top = 0;       /* the table and the counters start over */
-#endif
+        g.n = g.top = 0;               /* the table and the counters start over */
         reset();
         break;
     case APP_KEY_3:
@@ -1010,21 +892,15 @@ static void keys(void)
             retune();
         }
         break;
-#ifndef DIAG
     /* raw keys, as the F4HWN list apps: UP / LEFT on the K1 goes up the list */
     case APP_KEY_UP:
-        if (g.sel)
-            g.sel--;
-        if (g.sel < g.top)
-            g.top = g.sel;
+        if (g.top)
+            g.top--;
         break;
     case APP_KEY_DOWN:
-        if (g.sel + 1u < g.n)
-            g.sel++;
-        if (g.sel >= g.top + ROWS_SHOWN)
-            g.top = (uint8_t)(g.sel - (ROWS_SHOWN - 1u));
+        if (g.top + ROWS_SHOWN < g.n)
+            g.top++;
         break;
-#endif
     default:
         break;
     }
@@ -1036,18 +912,13 @@ void app_main(const app_api_t *api)
     uint8_t runs[MAX_RUNS];            /* on the stack, outside the overlay */
     rows_t rows;
     uint16_t floorq[N_PTS];
-#ifdef DIAG
-    uint8_t keep[FRAME];               /* emptied by retune() -> reset() */
-    g.keep = keep;
-#else
     sensor_t tab[N_SENS];
-    g.tab = tab;
-#endif
 
     A = api;
     g.runs = runs;
     g.rows = &rows;
     g.floorq = floorq;
+    g.tab = tab;
     g.r.proto = NO_READING;            /* the rest of g starts at 0 */
     g.prev = api->get_key();           /* the MENU that started the app */
 

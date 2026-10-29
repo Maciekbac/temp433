@@ -3,8 +3,6 @@
 #
 # Uses the SDK of the firmware tree when this folder sits in App/apps/,
 # otherwise the one fetched into sdk/ by tools/fetch_sdk.py.
-# DIAG=1 builds the diagnostic variant (Temp433diag.app) used for receiver
-# measurements; it is not a release build.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -14,9 +12,6 @@ APP_NAME="Temp 433"
 APP_VER="0.1"
 APP_API_MIN=3
 APP_VMA=${APP_VMA:-0x20000280}
-EXTRA=""
-REQUIRE=()
-if [ "${DIAG:-0}" = 1 ]; then APP_NAME="Temp 433 diag"; EXTRA="-DDIAG"; REQUIRE=(--require serial); fi
 OUT="${APP_NAME// /}"
 PYTHON=${PYTHON:-python3}
 
@@ -31,7 +26,7 @@ command -v "$CC" >/dev/null 2>&1 || { echo "❌ ARM compiler not found: $CC"; ex
 command -v "$OBJCOPY" >/dev/null 2>&1 || { echo "❌ ARM objcopy not found: $OBJCOPY"; exit 1; }
 
 CFLAGS="-mcpu=cortex-m0plus -mthumb -Os -std=gnu11 -ffreestanding -fno-builtin -fno-common \
-  -fomit-frame-pointer -ffunction-sections -fdata-sections -Wall -Wextra -I$SDK -I. $EXTRA"
+  -fomit-frame-pointer -ffunction-sections -fdata-sections -Wall -Wextra -I$SDK -I."
 LDFLAGS="-nostdlib -nostartfiles -T app.ld -Wl,--defsym,APP_VMA=${APP_VMA} \
   -Wl,--gc-sections -Wl,-Map=${APP}.map -Wl,--build-id=none -Wl,--no-warn-rwx-segments"
 
@@ -50,8 +45,7 @@ step 2 compile ; "$CC" $CFLAGS $LDFLAGS "${APP}_app.c" -lgcc -o "${APP}.elf"
 step 3 objcopy ; "$OBJCOPY" -O binary "${APP}.elf" "${APP}.bin"
 step 4 pack    ; "$PYTHON" "$SDK/pack_app.py" "${APP}.bin" "${OUT}.app" \
                    --name "$APP_NAME" --ver "$APP_VER" --api-min "$APP_API_MIN" \
-                   --vma "${APP_VMA}" --screensaver ${ASSETS[@]+"${ASSETS[@]}"} \
-                   ${REQUIRE[@]+"${REQUIRE[@]}"} >/dev/null
+                   --vma "${APP_VMA}" --screensaver ${ASSETS[@]+"${ASSETS[@]}"} >/dev/null
 trap - ERR
 
 BYTES=$(wc -c < "${APP}.bin")
