@@ -12,9 +12,17 @@ The app only receives. It never transmits.
 
 ## Screen and keys
 
-Each row is one sensor: model, channel, ID, temperature (°C), humidity, the
-time since its last reading, and `!` for a low battery. Up to six rows show at
-a time; the arrows in the status line mark more rows above or below. The
+Each row is one sensor: model, channel, ID, temperature (°C, shown as `23.9C`),
+humidity, the time since its last reading, and `!` right after it for a low
+battery:
+
+```
+INFACTORY 3 205  -7.3C 99%   2s!
+NEXUS     1 136  12.5C 60%  26s
+```
+
+Up to six rows show at a time; the arrows in the status line mark more rows
+above or below. The
 bottom line shows the range (or the frequency) and how many packets were
 decoded (`ok`) and not recognised (`?`). The status line shows AUTO or VFO,
 the sensitivity (1-3 bars) and the speaker.

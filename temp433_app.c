@@ -790,8 +790,8 @@ static char *put_age(char *o, uint32_t ms)
 
 /* Status line: title, AUTO / VFO, sensitivity bars, speaker and scroll marks,
  * battery.  Lines 0-5: one sensor a row, in the 32 columns of the 3x5 font:
- *   INFACTORY 3 205  -7.3 100%  1m !
- *   model     ch id  temp hum   age low battery
+ *   INFACTORY 3 205  -7.3C 100%  1m!
+ *   model     ch id  temp  hum  age, low battery
  * Line 6: a dotted line, then the range (or the frequency) and the counts. */
 __attribute__((noinline))
 static void draw(void)
@@ -830,11 +830,12 @@ static void draw(void)
         b[10] = (char)('0' + e->ch);
         rput(b + 15, v, putu(v, e->id));
         rput(b + 21, v, put_t10(v, e->t10));
+        b[21] = 'C';
         if (e->hum == NO_HUM)
-            b[22] = b[23] = '-';
+            b[23] = b[24] = '-';
         else
-            *putu(b + 22, e->hum) = '%';
-        rput(b + 30, v, put_age(v, now - e->seen));
+            *putu(b + 23, e->hum) = '%';
+        rput(b + 31, v, put_age(v, now - e->seen));
         if (e->low)
             b[31] = '!';
         b[32] = 0;
