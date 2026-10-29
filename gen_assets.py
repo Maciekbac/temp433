@@ -39,16 +39,19 @@ def mid(a_us, b_us):
 
 # The screen texts, each padded to a multiple of 4 bytes: draw() reads them in
 # one asset_read into a word-aligned stack block.
+RANGE = "433.80-434.04"          # AUTO: F_FIRST and N_PTS in temp433_app.c
 UI = [
     ("T_TITLE",  "TEMP 433"),
     ("T_AUTO",   "AUTO "),
     ("T_VFO",    "VFO "),
     ("T_OK",     " ok "),
     ("T_UNKNOWN", " ?"),
+    ("T_RANGE",  RANGE),                                  # AUTO, bottom line
     ("T_VHF1",   "No 433 sensors on VHF"),
     ("T_VHF2",   "Tune the VFO to 433.920"),
-    ("T_HINT",   "5: search 433.80-434.04 (AUTO)"),   # VFO, empty table
+    ("T_HINT",   "5: search " + RANGE + " (AUTO)"),       # VFO, empty table
 ]
+NAME_W = 10                      # model names, space padded: table columns 0-9
 
 # Status line icons, vertical bytes, bit 0 at the top.  The speaker and the
 # scroll marks are the bitmaps of the F4HWN apps (FoxHunt, AIS RX; Apache-2.0,
@@ -92,16 +95,24 @@ FAMILIES = [
 ]
 
 # ---- checks -------------------------------------------------------------------
+# (kind, ca, cb, cc, per8, sub): check() in temp433_app.c runs one loop for
+# both kinds, x from cb, x += key (C_SUM) or x ^= key (C_DIGEST) for every 1
+# of the first c1 bits, the key from ca stepped back after each bit as an
+# LFSR with cc; per8: the key starts over every 8 bits; nibble `sub` read from
+# bits 36-39 (NO_SUB: none).
 C_NONE, C_SUM, C_DIGEST = range(3)
+NO_SUB = 0xFF
 
-NIBBLE_SUM = (C_SUM, 4, 0, 0, 0)        # the nibbles (bytes) of the first c1 bits,
-BYTE_SUM = (C_SUM, 8, 0, 0, 0)          # the last one zero padded
+# The nibbles (bytes) of the first c1 bits, the last one zero padded: the key
+# 8 4 2 1 8 ... (128 64 .. 1 128 ...) is each bit's weight in its unit.
+NIBBLE_SUM = (C_SUM, 8, 0, 8, 0, NO_SUB)
+BYTE_SUM = (C_SUM, 128, 0, 128, 0, NO_SUB)
 
 def _step(k, poly, w):
     top, mask = 1 << (w - 1), (1 << w) - 1
     return ((k << 1) ^ poly) & mask if k & top else (k << 1) & mask
 
-def crc_digest(poly, w, length, init=0, per8=False, sub=None):
+def crc_digest(poly, w, length, init=0, per8=False, sub=NO_SUB):
     """C_DIGEST constants of a CRC (MSB first, no reflection, no final XOR) of
     width w over `length` message bits: the start key is the CRC that bit 0
     alone leaves, x starts as the init pushed through `length` zero bits, and
@@ -113,7 +124,7 @@ def crc_digest(poly, w, length, init=0, per8=False, sub=None):
     x0 = init
     for _ in range(length):
         x0 = _step(x0, poly, w)
-    return (C_DIGEST, key, x0, (poly >> 1) | (1 << (w - 1)), (0xF if sub is None else sub) << 4 | per8)
+    return (C_DIGEST, key, x0, (poly >> 1) | (1 << (w - 1)), int(per8), sub)
 
 def lfsr_digest(gen, key, length):
     """C_DIGEST constants of an LFSR digest that takes the bits last to first
@@ -121,7 +132,7 @@ def lfsr_digest(gen, key, length):
     to last, the key starts where that one ends and steps back"""
     for _ in range(length - 1):
         key = _step(key, gen, 8)
-    return (C_DIGEST, key, 0, (gen >> 1) | 0x80, 0xF0)
+    return (C_DIGEST, key, 0, (gen >> 1) | 0x80, 0, NO_SUB)
 
 # temperature: t_fl flags, t_off x 10 below 0 C (0.1 C) or below 32 F (0.1 F)
 T_SIGNED, T_LE, T_DEC, T_F = 1, 2, 4, 8
@@ -131,14 +142,14 @@ F_CH1, F_BATOK, F_HSWAP, F_HBCD = 1, 2, 4, 8
 F_HREJ, F_CHNZ = 16, 32           # rtl_433 drops a frame with a humidity over 100 % / channel 0
 
 # name (<= 9 chars), family, bits min/max, skip, flags, repeats,
-# check (kind, ca, cb, cc, cfl) with c1 (bits checked), cpos and cw (the check field),
+# check (kind, ca, cb, cc, per8, sub) with c1 (bits checked), cpos and cw (the check field),
 # fixed (pos, len, value) from the row start, id (pos, len), channel (pos, len),
 # battery bit, temp (pos, flags, offset), hum (pos, bits)
 P = []
 def proto(name, fam, bits, skip, flags, reps, check, c, fixed, ident, ch, bat, temp, hum):
     P.append((name, fam, bits, skip, flags, reps, check, c, fixed, ident, ch, bat, temp, hum))
 
-NOCHECK = (C_NONE, 0, 0, 0, 0)
+NOCHECK = (C_NONE, 0, 0, 0, 0, NO_SUB)
 # Within a family the protocols with a check come first (the no-check Nexus,
 # Prologue and AFW2A1 would otherwise take their frames), the stronger checks
 # before the weaker ones.
@@ -178,28 +189,39 @@ proto("LACROSSE", 7, (44, 44), 0, 0, 1, NIBBLE_SUM, (40, 40, 4),
 
 assert len(P) <= 16
 
-# ---- self-check of the digest constants -----------------------------------------
-# The CRCs and the LFSR digest as their sources define them, against the
-# digest loop of check() in temp433_app.c, on fixed pseudo-random frames.
+# ---- self-check of the check constants ------------------------------------------
+# The CRCs and the LFSR digest as their sources define them, and the plain
+# nibble and byte sums, against the loop of check() in temp433_app.c, on
+# fixed pseudo-random frames.
 def _bits(frame):
     return [(frame[i >> 3] >> (7 - (i & 7))) & 1 for i in range(8 * len(frame))]
 
-def _digest(check, c, b, skip):
-    """the C_DIGEST loop of check() in temp433_app.c"""
-    _, key0, x, gi, cfl = check
+def _field(b, pos, n):
+    v = 0
+    for i in range(n):
+        v = v << 1 | b[pos + i]
+    return v
+
+def _check(check, c, b, skip):
+    """check() in temp433_app.c"""
+    kind, key0, x, gi, per8, sub = check
     c1, cpos, cw = c
     key = key0
     for pos in range(c1):
-        q = 36 + (pos & 3) if (pos >> 2) == (cfl >> 4) else pos
+        q = 36 + (pos & 3) if (pos >> 2) == sub else pos
         if b[skip + q]:
-            x ^= key
+            x = (x + key) & 0xFFFF if kind == C_SUM else x ^ key
         key = (key >> 1) ^ gi if key & 1 else key >> 1
-        if (cfl & 1) and (pos & 7) == 7:
+        if per8 and (pos & 7) == 7:
             key = key0
-    v = 0
-    for i in range(cw):
-        v = v << 1 | b[skip + cpos + i]
-    return (x & ((1 << cw) - 1)) == v
+    if kind == C_SUM and not x:
+        return False
+    return (x & ((1 << cw) - 1)) == _field(b, skip + cpos, cw)
+
+def _sum(b, skip, c1, w):
+    """the w-bit units of the first c1 bits added up, the last one zero padded"""
+    return sum(_field(b, skip + pos, min(w, c1 - pos)) << (w - min(w, c1 - pos))
+               for pos in range(0, c1, w))
 
 def _crc(msg, poly, init, w):
     r = init << (8 - w)
@@ -222,10 +244,21 @@ def _lfsr_reflect(msg, gen, key):
 seed = 0x1234567
 for _ in range(64):
     m = []
-    for _ in range(6):
+    for _ in range(16):                   # EMOS: 120 bits
         seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
         m.append(seed >> 16 & 0xFF)
     for name, fam, _, skip, _, _, check, c, *_ in P:
+        if check[0] == C_SUM:
+            c1, cpos, cw = c
+            b = _bits(m)
+            s = _sum(b, skip, c1, check[1].bit_length())   # key 8: nibbles, 128: bytes
+            for i in range(cw):
+                b[skip + cpos + i] = s >> (cw - 1 - i) & 1
+            assert _check(check, c, b, skip), name
+            b[19] ^= 1                    # one bit off: the check must fail
+            assert not _check(check, c, b, skip), name
+            assert not _check(check, c, [0] * len(b), skip), name   # all zero
+            continue
         if check[0] != C_DIGEST:
             continue
         f = list(m)
@@ -244,23 +277,24 @@ for _ in range(64):
             f[4] = _lfsr_reflect(f[:4], 0x31, 0xF4)
         elif name == "AUR-HG02":
             f[4] = _crc([f[0] ^ f[1] ^ f[2] ^ f[3]], 0x31, 0x53, 8)
-        assert _digest(check, c, _bits(f), skip), name
+        assert _check(check, c, _bits(f), skip), name
         f[2] ^= 0x10                      # one bit off: the check must fail
-        assert not _digest(check, c, _bits(f), skip), name
+        assert not _check(check, c, _bits(f), skip), name
 
 fam_blob = b"".join(struct.pack("<8B", kind, thr, brk, end, glitch, pulse, pmax, 0)
                     for (_, kind, thr, brk, end, glitch, pulse, pmax) in FAMILIES)
 proto_blob = b""
-for (name, fam, (bmin, bmax), skip, flags, reps, (ck, ca, cb, cc, cfl), (c1, cpos, cw), fixed, ident, ch, bat,
-     (tpos, tfl, toff), hum) in P:
+for (name, fam, (bmin, bmax), skip, flags, reps, (ck, ca, cb, cc, per8, sub), (c1, cpos, cw), fixed, ident, ch,
+     bat, (tpos, tfl, toff), hum) in P:
     fp, fl, fv = fixed or (0, 0, 0)
-    assert all(0 <= v < 256 for v in (bmin, bmax, skip, ca, cb, cc, cfl, c1, cpos, cw, fp, fl, bat, toff))
-    assert bmax <= 127 and fl <= 16 and cw <= 8 and len(name) <= 9
+    assert all(0 <= v < 256 for v in (bmin, bmax, skip, ca, cb, cc, sub, c1, cpos, cw, fp, fl, bat, toff))
+    assert bmax <= 127 and fl <= 16 and cw <= 8 and len(name) < NAME_W
+    assert sub == NO_SUB or 4 * sub + 4 <= c1          # the nibble is one of the checked
     proto_blob += struct.pack("<32B", fam, bmin, bmax, skip, flags, reps,
-                              ck, c1, cpos, cw, ca, cb, cc, cfl,
+                              ck, c1, cpos, cw, ca, cb, cc, per8,
                               fp, fl, fv >> 8, fv & 0xFF,
                               ident[0], ident[1], ch[0], ch[1], bat,
-                              tpos, tfl, toff, hum[0], hum[1], 0, 0, 0, 0)
+                              tpos, tfl, toff, hum[0], hum[1], sub, 0, 0, 0)
 
 a = Assets("TEMP433")
 ui_size = 0
@@ -270,7 +304,8 @@ for name, text in UI:
     ui_size += len(text) + 1 + pad
 a.const("UI_SIZE", ui_size)
 a.const("T_TITLE_CHARS", len(UI[0][1]))
-a.table("T_NAME", [p[0] for p in P])
+a.raw("T_NAME", b"".join(p[0].ljust(NAME_W).encode("ascii") for p in P))   # read into the row
+a.const("T_NAME_STRIDE", NAME_W)
 a.raw("FAMS", fam_blob)
 a.const("FAM_SIZE", 8)
 a.const("FAM_COUNT", len(FAMILIES))
