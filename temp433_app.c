@@ -18,7 +18,7 @@
  * Temp 433 - 433 MHz wireless temperature sensors, receive only: no tx_*
  * service of the API is called and the app never writes REG_33 (RF path, PA
  * enable) itself; api->led() rewrites it from the resident's GPIO state, only
- * the green LED bit changes.  Work in progress: the receiver, 14 decoders and
+ * the green LED bit changes.  Work in progress: the receiver, 12 decoders and
  * the sensor table.
  *
  * Receiver: the BK4829 in AM with the RX filters bypassed (RAW), AFC off, the
@@ -39,13 +39,14 @@
  * frequency halfway to the level that started it, so a steady carrier stops
  * triggering after a few tries.
  *
- * Decoders: one table record per protocol, no code of its own.  The checks
- * are two loops: a sum of 4- or 8-bit units, and a linear digest that covers
- * every CRC and LFSR check of the table (see check()); the temperature and
- * humidity encodings are flags.
+ * Decoders: one table record per protocol, no code of its own.  One loop
+ * runs every check of the table: a sum of 4- or 8-bit units, or a linear
+ * digest that covers every CRC and LFSR check (see check()); the temperature
+ * and humidity encodings are flags.
  *
- * Keys: UP/DOWN scroll the table, 1 speaker, 2 clear the table and the
- * counters, 3 sensitivity (High 6 dB, Normal 10 dB, Low 15 dB above the
+ * Keys: UP/DOWN select a sensor (its frequency, level and temperature trend
+ * in the bottom line), 1 speaker, 2 clear the table and the count of unknown
+ * packets, 3 sensitivity (High 6 dB, Normal 10 dB, Low 15 dB above the
  * noise), 5 AUTO / VFO, EXIT quit.
  */
 
@@ -103,18 +104,15 @@ enum { C_NONE, C_SUM, C_DIGEST };
 enum { EMPTY, PACKET, DECODED };
 #define F_CH1       1u                 /* flags: the channel is shown +1             */
 #define F_BATOK     2u                 /* the battery bit is 1 when OK (else when low) */
-#define F_HSWAP     4u                 /* humidity with its nibbles swapped          */
 #define F_HBCD      8u                 /* humidity in BCD                            */
 #define F_HREJ      16u                /* a humidity over 100 % rejects the frame    */
 #define F_CHNZ      32u                /* channel 0 rejects the frame                */
 #define T_SIGNED    1u                 /* t_fl: 12-bit two's complement, 0.1 C       */
-#define T_LE        2u                 /* the three nibbles last to first            */
-#define T_DEC       4u                 /* three decimal digits                       */
 #define T_F         8u                 /* 0.1 F, t_off x 10 below 32 F               */
 #define NO_HUM      0xFFu
 
 typedef struct {                       /* FAMS record of the assets (8 B)            */
-    uint8_t kind;                      /* 0 PPM, 1 PWM (long pulse 1), 3 PWM (short pulse 1) */
+    uint8_t kind;                      /* 0 PPM, 1 PWM (a long pulse is 1)           */
     uint8_t thr, brk, end;             /* bit threshold; a longer bit run ends the row (PPM: */
                                        /* a gap, PWM: a sync pulse); PWM: so does a  */
                                        /* gap longer than end, after its bit         */
@@ -136,26 +134,28 @@ typedef struct {
 } rows_t;
 
 typedef struct {                       /* a reading, and a row of the sensor table  */
-    uint8_t proto, id, ch, low, hum;
+    uint8_t proto, id, ch, low, hum, rssi;                  /* rssi: dBm + 160       */
     int16_t t10;                       /* 0.1 C                                     */
-    uint32_t seen;                     /* ticks_ms of the last one                  */
+    uint32_t seen, f;                  /* ticks_ms of the last one, its frequency   */
+    uint32_t ref, next;                /* trend (store()): t10 << 16 | ticks_ms >> 13 */
 } sensor_t;
 
 /* ---- screen ---- */
 #define N_SENS      12u                /* sensors kept; a new one replaces the one  */
                                        /* heard longest ago                         */
 #define ROWS_SHOWN  6u                 /* table rows, frame buffer lines 0-5        */
+#define SLOT        73u                /* trend: 10 min in 8.192 s ticks            */
 
 /* All the state in one struct (one base address for Thumb-1 code), the byte
  * fields first so their offsets fit ldrb's immediate.  The loader zeroes the
  * overlay at every launch. */
 static struct {
     uint8_t running, prev, saver, sens, spk, vhf, is_auto, pt, nrows, off, skip, hold_pt, aborted, pkt;
-    uint8_t n, top;                    /* table: sensors, first one shown           */
-    sensor_t r;                        /* the reading match() decodes               */
-    uint16_t reg2b, ctrl, packets, ok;
+    uint8_t n, sel, top;               /* table: sensors, selected, first shown     */
+    uint16_t reg2b, ctrl, unk;         /* unk: packets no protocol took             */
     uint32_t vfo, f0, armed, hold_until, led_until, next_draw;  /* led_until 0: LED off */
-    sensor_t *tab;                     /* [N_SENS] on app_main's stack              */
+    sensor_t *tab;                     /* [N_SENS] on app_main's stack, and after   */
+    sensor_t *rd;                      /* them the reading match() decodes          */
     const app_api_t *api;
     uint8_t *runs;                     /* [MAX_RUNS] on app_main's stack            */
     rows_t *rows;                      /* on app_main's stack                       */
@@ -381,10 +381,10 @@ static void row_end(void)
         g.nrows++;
 }
 
-/* one bit: PPM from the gap after the pulse, PWM from the pulse (kind 3: a
- * short pulse is 1).  A bit run longer than brk (PPM: a gap, PWM: a sync
- * pulse) ends the row instead; in PWM a gap longer than end ends it after the
- * bit (PPM: end 255, past every gap that gets here) */
+/* one bit: PPM from the gap after the pulse, PWM from the pulse.  A bit run
+ * longer than brk (PPM: a gap, PWM: a sync pulse) ends the row instead; in
+ * PWM a gap longer than end ends it after the bit (PPM: end 255, past every
+ * gap that gets here) */
 static void emit(const fam_t *f, unsigned pulse, unsigned gap)
 {
     rows_t *const r = g.rows;
@@ -395,7 +395,7 @@ static void emit(const fam_t *f, unsigned pulse, unsigned gap)
     }
     const uint8_t n = r->bits[g.nrows];
     if (n < ROW_BYTES * 8u) {
-        if ((v > f->thr) ^ (f->kind >> 1))
+        if (v > f->thr)
             r->bytes[g.nrows][n >> 3] |= (uint8_t)(0x80u >> (n & 7u));
         r->bits[g.nrows] = (uint8_t)(n + 1u);
     }
@@ -455,9 +455,9 @@ static unsigned bits(unsigned pos, unsigned len)
     return v;
 }
 
-/* noinline here and on put(), temperature(), decode(), grab(), put_t10(),
- * rput() and draw(): GCC 13.3 -Os makes the whole smaller with them out of
- * line, and keys() inline (each measured on the build; GCC's choices shift
+/* noinline here and on put(), decode(), grab(), put_t10(), rput() and draw():
+ * GCC 13.3 -Os makes the whole smaller with them out of line, and keys() and
+ * temperature() inline (each measured on the build; GCC's choices shift
  * with every change, so measure again after a bigger one) */
 __attribute__((noinline))
 static bool check(const proto_t *p)
@@ -496,15 +496,10 @@ static bool check(const proto_t *p)
 
 /* 0.1 C from 12 bits: two's complement, or t_off x 10 below 0 C (0.1 C) or
  * below 32 F (0.1 F) */
-__attribute__((noinline))
 static int16_t temperature(const proto_t *p)
 {
     const uint8_t fl = p->t_fl;
     uint16_t t = bits(p->t_pos, 12);
-    if (fl & T_LE)
-        t = (uint16_t)((t >> 8) | (t & 0xF0u) | (t & 0xFu) << 8);
-    if (fl & T_DEC)
-        t = (uint16_t)((t >> 8) * 100u + ((t >> 4) & 15u) * 10u + (t & 15u));
     if (fl & T_SIGNED)
         return (int16_t)((int16_t)(t << 4) >> 4);
     t = (uint16_t)(t - p->t_off * 10u);
@@ -519,8 +514,6 @@ static uint8_t humidity(const proto_t *p)
     if (!p->h_len)
         return 0;
     uint8_t h = (uint8_t)bits(p->h_pos, p->h_len);
-    if (p->flags & F_HSWAP)
-        h = (uint8_t)(h << 4 | h >> 4);
     if (p->flags & F_HBCD)
         h = (h & 15u) > 9u ? 0xFFu : (uint8_t)((h >> 4) * 10u + (h & 15u));
     return h;
@@ -568,12 +561,13 @@ static bool match(uint8_t f)
             const uint8_t ch = (uint8_t)(p.ch_len ? bits(p.ch_pos, p.ch_len) : 0u);
             if (t < -400 || t > 700 || ((p.flags & F_HREJ) && h > 100u) || ((p.flags & F_CHNZ) && !ch))
                 continue;
-            g.r.proto = (uint8_t)i;
-            g.r.id = (uint8_t)bits(p.id_pos, p.id_len);
-            g.r.ch = (uint8_t)(ch + (p.flags & F_CH1));
-            g.r.t10 = t;
-            g.r.hum = h && h <= 100u ? h : NO_HUM;
-            g.r.low = (uint8_t)(bits(p.bat, 1) ^ ((p.flags & F_BATOK) ? 1u : 0u));
+            sensor_t *const rd = g.rd;
+            rd->proto = (uint8_t)i;
+            rd->id = (uint8_t)bits(p.id_pos, p.id_len);
+            rd->ch = (uint8_t)(ch + (p.flags & F_CH1));
+            rd->t10 = t;
+            rd->hum = h && h <= 100u ? h : NO_HUM;
+            rd->low = (uint8_t)(bits(p.bat, 1) ^ ((p.flags & F_BATOK) ? 1u : 0u));
             return true;
         }
     }
@@ -599,26 +593,39 @@ static uint8_t decode(uint16_t n)
 
 /* ---- search ----------------------------------------------------------------- */
 
-/* the reading in g.r into the table: the same sensor (protocol, ID, channel)
+/* the reading g.rd into the table: the same sensor (protocol, ID, channel)
  * is updated in place, a new one goes at the end (the order they were first
- * heard in); a full table first drops the sensor heard longest ago */
+ * heard in); a full table first drops the sensor heard longest ago.
+ * Trend: a reading kept as its temperature and its time in 8.192 s ticks (16
+ * bits: 6 days around).  The reference starts as the first reading; once the
+ * next one is SLOT old it takes over and this reading becomes the next, so
+ * the reference is 10-20 min old (the first reading for the first 10-20 min) */
 static void store(void)
 {
-    sensor_t *const t = g.tab;
+    sensor_t *const t = g.tab, *const r = g.rd;
     uint8_t i = 0, old = 0;
     for (; i < g.n; i++) {
-        if (t[i].proto == g.r.proto && t[i].id == g.r.id && t[i].ch == g.r.ch)
+        if (t[i].proto == r->proto && t[i].id == r->id && t[i].ch == r->ch)
             break;
         if ((int32_t)(t[i].seen - t[old].seen) < 0)
             old = i;
     }
-    if (i == N_SENS) {
+    const uint32_t now = (uint32_t)r->t10 << 16 | (uint16_t)(r->seen >> 13);
+    r->ref = r->next = now;
+    if (i < g.n) {
+        r->ref = t[i].ref;
+        r->next = t[i].next;
+        if ((uint16_t)(now - r->next) >= SLOT) {
+            r->ref = r->next;
+            r->next = now;
+        }
+    } else if (i == N_SENS) {
         for (i = old; i + 1u < N_SENS; i++)
             t[i] = t[i + 1u];
-    } else if (i == g.n) {
+    } else {
         g.n++;
     }
-    t[i] = g.r;
+    t[i] = *r;
 }
 
 /* point p (level v) went over the threshold.  AUTO: a strong sensor ~20 kHz
@@ -652,13 +659,15 @@ static void grab(uint8_t p, uint8_t v)
         if (!g.aborted)                 /* a steady carrier joins the noise of */
             learn(p, v, 1);             /* the point it set off */
     } else {                            /* not a key cutting an empty one short */
-        g.packets++;
         g.hold_pt = q;
         g.hold_until = now + HOLD_MS;
     }
+    if (res == PACKET)
+        g.unk++;
     if (res == DECODED) {
-        g.ok++;
-        g.r.seen = now;
+        g.rd->f = freq(q);
+        g.rd->rssi = lv;
+        g.rd->seen = now;
         store();
         A->backlight_on();              /* also ends the screen saver */
         A->led(true);
@@ -710,10 +719,10 @@ static void scan(void)
     }
 }
 
-/* the packet counts start over */
+/* the count of packets no protocol took starts over */
 static void reset(void)
 {
-    g.packets = g.ok = 0;
+    g.unk = 0;
 }
 
 /* mode or frequency changed: the noise floor is learned again */
@@ -729,21 +738,6 @@ static void retune(void)
 }
 
 /* ---- screen ----------------------------------------------------------------- */
-
-/* "433.80-434.04" (AUTO, a text of the assets) or the VFO frequency */
-static char *put_range(char *o, const char *s)
-{
-    if (!g.is_auto)
-        return put_freq(o, g.f0);
-    return put(o, s + T_RANGE);
-}
-
-/* " ok 48 ?3": decoded packets, packets no protocol took */
-static char *put_counts(char *o, const char *s)
-{
-    o = put(putu(put(o, s + T_OK), g.ok), s + T_UNKNOWN);
-    return putu(o, (uint32_t)(g.packets - g.ok));
-}
 
 /* 0.1 C as "-12.3" */
 __attribute__((noinline))
@@ -783,10 +777,14 @@ static char *put_age(char *o, uint32_t ms)
 }
 
 /* Status line: title, AUTO / VFO, sensitivity bars, speaker and scroll marks,
- * battery.  Lines 0-5: one sensor a row, in the 32 columns of the 3x5 font:
+ * battery.  Lines 0-5: one sensor a row, in the 32 columns of the 3x5 font,
+ * the selected one inverted:
  *   INFACTORY 3 205  -7.3C 100%  1m!
  *   model     ch id  temp  hum  age, low battery
- * Line 6: a dotted line, then the range (or the frequency) and the counts. */
+ * Line 6: a dotted line, then the selected sensor's frequency, level and
+ * trend (the range or the frequency while the table is empty), and the count
+ * of unknown packets inverted at the right end:
+ *   433.940 -103dBm ^0.3/14m      ?3 */
 __attribute__((noinline))
 static void draw(void)
 {
@@ -801,6 +799,10 @@ static void draw(void)
     a->draw_battery();
     a->print_tiny(s + (g.is_auto ? T_AUTO : T_VFO), 37, 1, true, true);
     asset((uint16_t)(BMP_BARS + g.sens * BARS_W), a->status_line + 55, BARS_W);
+    if (g.sel < g.top)                 /* the selected row in view */
+        g.top = g.sel;
+    if (g.sel >= g.top + ROWS_SHOWN)
+        g.top = (uint8_t)(g.sel - (ROWS_SHOWN - 1u));
     unsigned tail = g.spk;
     if (g.top)
         tail += 2u;
@@ -833,11 +835,50 @@ static void draw(void)
             b[31] = '!';
         b[32] = 0;
         a->print_tiny(b, 0, (uint8_t)(r * 8u + 1u), false, true);
+        if ((uint8_t)(g.top + r) == g.sel)
+            for (unsigned x = 0; x < 128u; x++)
+                a->fb[r][x] ^= 0xFFu;
     }
 
+    /* the selected sensor: where, how strong, and the change of its
+     * temperature since the trend reference, over how long; with no sensor
+     * the range ("433.80-434.04", a text of the assets) or the VFO frequency */
+    char *o;
+    e = g.tab + g.sel;
+    if (g.n || !g.is_auto) {
+        o = put_freq(b, g.n ? e->f : g.f0);
+        if (g.n) {
+            *o++ = ' ';
+            *o++ = '-';
+            o = put(putu(o, 160u - e->rssi), s + T_DBM);
+            const unsigned span = (uint16_t)((e->seen >> 13) - e->ref);
+            if (span) {                 /* not the first reading alone */
+                /* the arrow, 5 px wide, in a space and one more cell */
+                const int d = e->t10 - (int16_t)(e->ref >> 16);
+                o[0] = o[1] = ' ';
+                if (d)
+                    asset((uint16_t)(BMP_TREND + (d < 0 ? TREND_W : 0u)),
+                          a->fb[6] + 4u * (unsigned)(o - b) + 1u, TREND_W);
+                else
+                    o[1] = '=';
+                o = put_fixed(o + 2, (uint32_t)(d < 0 ? -d : d), 10u);
+                *o++ = '/';
+                o = put_age(o, span << 13);
+            }
+        }
+    } else {
+        o = put(b, s + T_RANGE);
+    }
+    /* "?3": the packets no protocol took, inverted at the right end (a count
+     * of the app, not a detail of the selected sensor); x odd, so the dotted
+     * line drawn after it leaves its rounded ends alone */
+    v[0] = '?';
+    char *const ve = putu(v + 1, g.unk);
+    *ve = 0;
+    a->print_inverse(v, (uint8_t)(127u - 4u * (unsigned)(ve - v)), 6, false, true, 127);
     for (unsigned x = 0; x < 128u; x += 2u)
         a->fb[6][x] |= 0x01u;
-    tiny(b, put_counts(put_range(b, s), s), 50);
+    tiny(b, o, 50);
 }
 
 /* ---- keys ------------------------------------------------------------------- */
@@ -866,7 +907,7 @@ static void keys(void)
         A->audio_path(g.spk);
         break;
     case APP_KEY_2:
-        g.n = g.top = 0;               /* the table and the counters start over */
+        g.n = g.sel = g.top = 0;       /* the table and the count start over */
         reset();
         break;
     case APP_KEY_3:
@@ -881,13 +922,13 @@ static void keys(void)
         }
         break;
     /* raw keys, as the F4HWN list apps: UP / LEFT on the K1 goes up the list */
-    case APP_KEY_UP:
-        if (g.top)
-            g.top--;
+    case APP_KEY_UP:                   /* draw() scrolls to the selection */
+        if (g.sel)
+            g.sel--;
         break;
     case APP_KEY_DOWN:
-        if (g.top + ROWS_SHOWN < g.n)
-            g.top++;
+        if (g.sel + 1u < g.n)
+            g.sel++;
         break;
     default:
         break;
@@ -900,13 +941,14 @@ void app_main(const app_api_t *api)
     uint8_t runs[MAX_RUNS];            /* on the stack, outside the overlay */
     rows_t rows;
     uint16_t floorq[N_PTS];
-    sensor_t tab[N_SENS];
+    sensor_t tab[N_SENS + 1u];         /* the sensors, then the reading in decoding */
 
     A = api;
     g.runs = runs;
     g.rows = &rows;
     g.floorq = floorq;
-    g.tab = tab;                       /* the rest of g starts at 0 */
+    g.tab = tab;
+    g.rd = tab + N_SENS;               /* the rest of g starts at 0 */
     g.prev = api->get_key();           /* the MENU that started the app */
 
     api->af_capture_open();            /* PA4 bias and ADC channel 4, restored by close */

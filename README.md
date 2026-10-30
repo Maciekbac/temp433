@@ -1,47 +1,119 @@
 # Temp 433
 
-A receive-only overlay app for the [F4HWN firmware](https://github.com/armel/uv-k1-k5v3-firmware-custom)
-on the Quansheng UV-K1 and UV-K5 V3 radios: it listens on 433 MHz for wireless
-temperature sensors.
+[![Build](https://github.com/Maciekbac/temp433/actions/workflows/build.yml/badge.svg)](https://github.com/Maciekbac/temp433/actions/workflows/build.yml)
 
-**Status:** work in progress. The current build has the receiver (a sweep of
-433.80-434.04 MHz, or the VFO frequency) and decodes the sensors listed
-below into a table of up to 12 sensors.
+A receive-only overlay app for the
+[F4HWN firmware](https://github.com/armel/uv-k1-k5v3-firmware-custom) that reads
+433 MHz wireless temperature sensors on the Quansheng UV-K1 and UV-K5 V3.
 
-The app only receives. It never transmits.
+![Temp 433 with six sensors, the first one selected](docs/table.png)
 
-## Screen and keys
+## Features
 
-Each row is one sensor: model, channel, ID, temperature (°C, shown as `23.9C`),
-humidity, the time since its last reading, and `!` right after it for a low
-battery:
+- Reads 11 kinds of 433 MHz thermometers and thermo-hygrometers (see
+  [Supported sensors](#supported-sensors)).
+- A table of up to 12 sensors: model, channel, ID, temperature, humidity, the
+  time since the last reading, and a low battery mark.
+- Searches the whole 433.80-434.04 MHz band (AUTO), or listens on the VFO
+  frequency only.
+- For the selected sensor: the frequency it is heard on, its signal level, and
+  how its temperature changed over the last 10-20 minutes.
+- Receive only: the app never transmits.
+
+## Requirements
+
+- A Quansheng UV-K1 or UV-K5 V3 with F4HWN Labs v6.3.0 or later, or a later
+  edition with overlay apps (API level 3 or higher).
+- Tested on a UV-K1 with F4HWN Labs v6.3.0.
+
+## Install
+
+1. Download `Temp433.app` from the
+   [Releases](https://github.com/Maciekbac/temp433/releases) page.
+2. In UV Studio, open Apps, connect the radio and install `Temp433.app` from a
+   local file.
+3. On the radio, open the Apps menu (`F` then `7`), select Temp 433 and press
+   `MENU`.
+
+## Quick start
+
+**1. Start on 433.920 MHz.** Tune the VFO to 433.920 (any frequency from
+433.80 to 434.04 MHz will do) and start the app. It starts in AUTO and sweeps
+the whole band, because the sensors' frequencies spread up to ±75 kHz around
+433.92.
+
+![AUTO, nothing heard yet](docs/start-auto.png)
+
+Most sensors transmit every 30-90 seconds, so the first rows come after a
+minute or two.
+
+**2. Read the table.** Each heard sensor gets a row, in the order they were
+first heard:
+
+![The sensor table](docs/table.png)
+
+| Column | Example | Meaning |
+|---|---|---|
+| model | `INFACTORY` | the sensor type (see the table below) |
+| channel | `3` | the channel switch of the sensor |
+| ID | `205` | a code the sensor picks, often anew after a battery change |
+| temperature | `4.9C` | °C |
+| humidity | `92%` | `--` for sensors without one |
+| age | `8s` | time since the last reading (`s`, `m`, `h`) |
+| `!` | `8s!` | low battery |
+
+Six rows show at a time; arrows in the status line mark more rows above or
+below.
+
+**3. Select a sensor.** UP and DOWN move the selection (the inverted row). The
+bottom line shows that sensor's details:
 
 ```
-INFACTORY 3 205  -7.3C 99%   2s!
-NEXUS     1 136  12.5C 60%  26s
+433.920 -84dBm ▼0.3/1m      ?3
 ```
 
-Up to six rows show at a time; the arrows in the status line mark more rows
-above or below. The
-bottom line shows the range (or the frequency) and how many packets were
-decoded (`ok`) and not recognised (`?`). The status line shows AUTO or VFO,
-the sensitivity (1-3 bars) and the speaker.
+- `433.920`: the frequency it was last heard on.
+- `-84dBm`: its signal level.
+- `▼0.3/1m`: the temperature trend. The last reading is compared with one
+  10-20 minutes older, or with the first one while the sensor has been heard
+  for less than that: `▲` up, `▼` down, `=` no change, then the change in °C
+  and over how long.
+- The inverted `?3` at the right counts the packets no decoder recognised:
+  sensors of other kinds, or damaged frames. It is a count for the whole app,
+  not for the selected sensor.
+
+**4. Listen on one frequency.** Started anywhere else on UHF, the app listens
+on the VFO frequency only (VFO mode) and, until a sensor is heard, reminds you
+that key `5` searches the whole band:
+
+![VFO mode, nothing heard yet](docs/vfo-hint.png)
+
+On VHF the app asks you to tune the VFO to 433.920 first.
+
+## Keys
 
 | Key | Action |
 |---|---|
-| UP / DOWN | scroll the table |
-| 1 | speaker on / off |
-| 2 | clear the table and the counts |
+| UP / DOWN | select a sensor |
+| 1 | speaker on / off (the sensor bursts are heard as buzzes) |
+| 2 | clear the table and the `?` count |
 | 3 | sensitivity: High (6 dB), Normal (10 dB), Low (15 dB) above the noise |
 | 5 | AUTO (433.80-434.04 MHz) or the VFO frequency |
 | EXIT | quit |
 
-Started on 433.80-434.04 MHz the app sweeps that range (AUTO); on any other
-UHF frequency it listens there only (VFO); until a sensor is heard there, a
-line reminds you that key 5 searches the whole range. On VHF it asks you to
-tune the VFO to 433.920.
+## Tips
 
-## Sensors
+- **Sensitivity.** The app always starts on High, which hears the weakest
+  sensors. Normal and Low (key `3`, shown as 3, 2 or 1 bars) ignore weaker
+  signals, which can help next to a strong source of interference.
+- **A weak sensor.** In AUTO the app shares its time among 25 frequencies.
+  If a distant sensor comes and goes, note its frequency in the bottom line,
+  exit, tune the VFO exactly there and start the app again: in VFO mode it
+  listens on that frequency all the time.
+- **Unknown sensors.** If the `?` count grows while no row appears, a sensor
+  of a kind the app does not read is probably nearby.
+
+## Supported sensors
 
 | Shown as | Protocol (rtl_433 decoder) | Also sold as |
 |---|---|---|
@@ -52,37 +124,45 @@ tune the VFO to 433.920.
 | AUR-AHFL | Auriol-AHFL | Lidl Auriol AHFL 433 B2 |
 | AUR-AFW2 | Auriol-AFW2A1 | Lidl Auriol AFW 2 A1 |
 | AUR-HG02 | Auriol-HG02832 | Lidl Auriol HG02832, HG05124A, Rubicson 48957 |
-| ESPERANZA | Esperanza-EWS | Kedsum, Conrad S3318P |
 | INFACTORY | inFactory-TH | nor-tec, FreeTec NC-3982 |
 | TX141TH | LaCrosse-TX141THBv2 | TFA 30.3221 |
 | BRESSER | Bresser-3CH | Renkforce DM-7511 |
 | EMOS | EMOS-E6016, EMOS-E6018 | |
-| LACROSSE | LaCrosse-TX (temperature) | La Crosse TX3, TX4, TX6U, TX7U |
 
-The frame layouts, timings and checks follow the device descriptions in
-[rtl_433](https://github.com/merbanan/rtl_433) (`src/devices/`), used as a
-specification only: the decoders here are written from them, no code is
-taken. Channels and IDs are shown as rtl_433 shows them, so you can compare
-the two.
+Not supported: 868 MHz sensors, Manchester-coded ones (Oregon Scientific,
+Hideki, Ambient Weather F007TH), AlectoV1, Esperanza EWS and La Crosse TX3.
 
-Limitations:
+The frame formats come from the device notes of
+[rtl_433](https://github.com/merbanan/rtl_433), thanks to its authors.
+Channels and IDs are shown the way rtl_433 shows them, so the two can be
+compared side by side.
+
+## Limitations
+
 - A humidity outside 1-100 % shows as `--` (rtl_433 drops such a frame).
+- Temperatures outside -40 to 70 °C are dropped as misreadings.
 - GT-WT-02 humidity codes 10 and 110, which rtl_433 shows as 0 % and 100 %,
   show as `10%` and `--`.
-- La Crosse TX: temperature only; its humidity frames are skipped, and the
-  parity bit and the repeated digits are not checked.
 - Nexus, Prologue and Auriol AFW 2 A1 send no checksum: a reading counts once
   the same frame comes twice.
-- Within one timing, the decoders are tried in order; a 42-bit inFactory frame
-  could pass the 4-bit check of Esperanza now and then (40-bit ones cannot).
+- The table keeps 12 sensors; a new one then replaces the one heard longest
+  ago. The table is not kept after the app exits.
 
-## Requirements
+## How it works
 
-- F4HWN Labs v6.3.0 or later, or a later edition with overlay apps (API level 3
-  or higher).
-- To build: `arm-none-eabi-gcc` on the `PATH`, Python 3 and bash.
+The radio's receiver runs in AM with its audio filters bypassed and a fixed
+gain, so its audio output is the on/off envelope of the sensor bursts. In AUTO
+the app steps through 433.80-434.04 MHz in 10 kHz steps, visiting 433.92 at
+every other step, and keeps a noise level for each frequency. A reading the
+chosen sensitivity above that noise starts a capture: the audio is sampled at
+20 kHz until it goes quiet. The capture is cut into pulses and gaps, decoded
+as pulse-position (PPM) or pulse-width (PWM) bits, and matched against a table
+of protocols. One loop runs every checksum of the table: nibble and byte sums,
+CRC-4, CRC-8 and the LFSR digest.
 
 ## Build
+
+To build: `arm-none-eabi-gcc` on the `PATH`, Python 3 and bash.
 
 ```sh
 python3 tools/fetch_sdk.py   # downloads the F4HWN app SDK into sdk/
@@ -96,12 +176,9 @@ The folder can also be copied to `App/apps/temp433/` in the firmware tree. It
 then builds with the firmware's own SDK, with `./compile-app.sh temp433` from
 the firmware root.
 
-## Install
-
-In UV Studio, open Apps, connect the radio and install `Temp433.app` from a
-local file. On the radio, open the Apps menu (`F` then `7`), select Temp 433
-and press `MENU`.
-
 ## License
 
-Apache License 2.0, see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Apache License 2.0, see [LICENSE](LICENSE) and [NOTICE](NOTICE). The app is
+built against the overlay-app SDK of the F4HWN firmware, and the speaker and
+scroll-mark bitmaps of the status line come from the F4HWN apps FoxHunt and
+AIS RX; NOTICE has the details.
