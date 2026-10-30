@@ -13,3 +13,7 @@ included in this repository; tools/fetch_sdk.py downloads them.
 
 build.sh and app.ld are based on the build script and linker script of the
 F4HWN overlay apps.
+
+The status line bitmaps of the speaker and of the scroll marks, and the way
+the scroll marks are drawn, come from the F4HWN apps FoxHunt and AIS RX,
+Copyright 2026 Armel F4HWN, licensed under the Apache License, Version 2.0.
