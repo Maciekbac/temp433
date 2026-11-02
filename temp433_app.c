@@ -119,14 +119,20 @@ typedef struct {                       /* FAMS record of the assets (8 B)       
     uint8_t glitch, pulse, pmax, pad;  /* PPM: a pulse longer than pmax is pulse plus noise */
 } fam_t;
 
+/* the fields of a frame, read in one loop by match(); a field of length 0
+ * reads as 0 */
+enum { V_FIX, V_ID, V_CH, V_BAT, V_T, V_H, N_FLD };
+
 typedef struct {                       /* PROTOS record of the assets (32 B)         */
     uint8_t fam, bmin, bmax, skip, flags, reps;
     uint8_t check, c1, cpos, cw, ca, cb, cc, cfl;      /* see check()               */
-    uint8_t fix_pos, fix_len, fix_hi, fix_lo;          /* from the row start         */
-    uint8_t id_pos, id_len, ch_pos, ch_len, bat;
-    uint8_t t_pos, t_fl, t_off, h_pos, h_len;
-    uint8_t csub, pad[3];              /* csub here: 12 B less code than after cfl */
+    uint8_t fld[N_FLD][2];             /* (pos, len) of each field, from the row    */
+                                       /* start (gen_assets.py adds the skipped bits */
+                                       /* to all but the fixed bits; cpos too)       */
+    uint16_t fix_v;                    /* the value the fixed bits must hold         */
+    uint8_t t_fl, t_off, csub, pad;
 } proto_t;
+_Static_assert(sizeof(fam_t) == FAM_SIZE && sizeof(proto_t) == PROTO_SIZE, "the records of gen_assets.py");
 
 typedef struct {
     uint8_t bytes[ROWS][ROW_BYTES];
@@ -150,9 +156,9 @@ typedef struct {                       /* a reading, and a row of the sensor tab
  * fields first so their offsets fit ldrb's immediate.  The loader zeroes the
  * overlay at every launch. */
 static struct {
-    uint8_t running, prev, saver, sens, spk, vhf, is_auto, pt, nrows, off, skip, hold_pt, aborted, pkt;
+    uint8_t running, prev, saver, sens, spk, vhf, is_auto, pt, nrows, off, hold_pt, aborted, pkt;
     uint8_t n, sel, top;               /* table: sensors, selected, first shown     */
-    uint16_t reg2b, ctrl, unk;         /* unk: packets no protocol took             */
+    uint16_t ctrl, unk;                /* unk: packets no protocol took             */
     uint32_t vfo, f0, armed, hold_until, led_until, next_draw;  /* led_until 0: LED off */
     sensor_t *tab;                     /* [N_SENS] on app_main's stack, and after   */
     sensor_t *rd;                      /* them the reading match() decodes          */
@@ -228,9 +234,10 @@ static char *put_freq(char *o, uint32_t f)
     return o[-1] == '0' ? o - 1 : o;
 }
 
-static void tiny(char *s, char *end, uint8_t y)
+/* the 3x5 font from the left edge, not inverted */
+__attribute__((noinline))
+static void tiny(const char *s, uint8_t y)
 {
-    *end = 0;
     A->print_tiny(s, 0, y, false, true);
 }
 
@@ -269,12 +276,13 @@ static uint8_t measure(void)
 }
 
 /* noise floor of point p toward v by 1/2^shift of the difference (truncated
- * toward zero: no drift either way) */
+ * toward zero: no drift either way; s = 0 or -1, (d ^ s) - s is |d|, and the
+ * same again gives the sign back) */
 static void learn(uint8_t p, uint8_t v, uint8_t shift)
 {
     uint16_t *const q = &g.floorq[p];
-    const int32_t d = (int32_t)(v << 8) - *q;
-    *q = (uint16_t)(*q + (d >= 0 ? d >> shift : -(-d >> shift)));
+    const int32_t d = (int32_t)(v << 8) - *q, s = d >> 31;
+    *q = (uint16_t)(*q + ((((d ^ s) - s) >> shift ^ s) - s));
 }
 
 /* ---- capture ---------------------------------------------------------------- */
@@ -443,11 +451,10 @@ static void demod(const fam_t *f, unsigned n, unsigned off)
 
 /* ---- protocol matching ------------------------------------------------------ */
 
-/* len (<= 16) bits of the current row from data bit pos (after the skipped bits) */
+/* len (<= 16) bits of the current row from bit pos, MSB first (len 0: 0) */
 static unsigned bits(unsigned pos, unsigned len)
 {
     unsigned v = 0;
-    pos += g.skip;
     while (len--) {
         v = (v << 1) | ((g.row[pos >> 3] >> (7u - (pos & 7u))) & 1u);
         pos++;
@@ -455,10 +462,11 @@ static unsigned bits(unsigned pos, unsigned len)
     return v;
 }
 
-/* noinline here and on put(), decode(), grab(), put_t10(), rput() and draw():
- * GCC 13.3 -Os makes the whole smaller with them out of line, and keys() and
- * temperature() inline (each measured on the build; GCC's choices shift
- * with every change, so measure again after a bigger one) */
+/* noinline here and on put(), tiny(), grab(), put_t10(), rput() and draw():
+ * GCC 13.3 -Os (with the flags of build.sh) makes the whole smaller with them
+ * out of line, and keys(), temperature() and decode() inline (each measured
+ * on the build; GCC's choices shift with every change, so measure again
+ * after a bigger one) */
 __attribute__((noinline))
 static bool check(const proto_t *p)
 {
@@ -474,7 +482,9 @@ static bool check(const proto_t *p)
      *     128 ...): the bit weights of the nibble (byte) sum, the last unit
      *     zero padded.
      * cfl bit 0: the key starts over every 8 bits (a CRC of the XOR of the
-     * bytes); nibble csub is read from bits 36-39 (inFactory; 0xFF: none) */
+     * bytes); nibble csub is read from bits 36-39 (inFactory; 0xFF: none).
+     * The checked bits count from the first data bit (after the skipped
+     * ones), cpos from the row start. */
     if (p->check == C_NONE)
         return true;                    /* the repeats decide */
     uint16_t x = p->cb;
@@ -483,7 +493,7 @@ static bool check(const proto_t *p)
         unsigned q = pos;
         if ((pos >> 2) == p->csub)
             q = 36u + (pos & 3u);
-        if (bits(q, 1))
+        if (bits(q + p->skip, 1))
             x = (uint16_t)(p->check == C_SUM ? x + key : x ^ key);
         key = (uint8_t)(key & 1u ? (key >> 1) ^ p->cc : key >> 1);
         if ((p->cfl & 1u) && (pos & 7u) == 7u)
@@ -494,12 +504,11 @@ static bool check(const proto_t *p)
     return (x & ((1u << p->cw) - 1u)) == bits(p->cpos, p->cw);
 }
 
-/* 0.1 C from 12 bits: two's complement, or t_off x 10 below 0 C (0.1 C) or
- * below 32 F (0.1 F) */
-static int16_t temperature(const proto_t *p)
+/* 0.1 C from the 12 bits t: two's complement, or t_off x 10 below 0 C (0.1 C)
+ * or below 32 F (0.1 F) */
+static int16_t temperature(const proto_t *p, unsigned t)
 {
     const uint8_t fl = p->t_fl;
-    uint16_t t = bits(p->t_pos, 12);
     if (fl & T_SIGNED)
         return (int16_t)((int16_t)(t << 4) >> 4);
     t = (uint16_t)(t - p->t_off * 10u);
@@ -508,15 +517,13 @@ static int16_t temperature(const proto_t *p)
     return (int16_t)t;
 }
 
-/* h_len bits (0: none), in % (over 100: no humidity, or a bad BCD digit) */
-static uint8_t humidity(const proto_t *p)
+/* the humidity field h (0: none) in % (over 100: no humidity, or a bad BCD
+ * digit) */
+static uint8_t humidity(const proto_t *p, unsigned h)
 {
-    if (!p->h_len)
-        return 0;
-    uint8_t h = (uint8_t)bits(p->h_pos, p->h_len);
     if (p->flags & F_HBCD)
-        h = (h & 15u) > 9u ? 0xFFu : (uint8_t)((h >> 4) * 10u + (h & 15u));
-    return h;
+        h = (h & 15u) > 9u ? 0xFFu : (h >> 4) * 10u + (h & 15u);
+    return (uint8_t)h;
 }
 
 /* identical rows to row r (itself included) */
@@ -539,6 +546,7 @@ static uint8_t same(uint8_t r)
 static bool match(uint8_t f)
 {
     proto_t p;
+    unsigned v[N_FLD];
     for (unsigned i = 0; i < PROTO_COUNT; i++) {
         asset((uint16_t)(PROTOS + i * PROTO_SIZE), &p, PROTO_SIZE);
         if (p.fam != f)
@@ -548,33 +556,30 @@ static bool match(uint8_t f)
             if (n < p.bmin || n > p.bmax)
                 continue;
             g.row = g.rows->bytes[r];
-            g.skip = 0;                 /* the fixed bits count from the row start */
-            if (p.fix_len && bits(p.fix_pos, p.fix_len) != (uint16_t)(p.fix_hi << 8 | p.fix_lo))
-                continue;
-            g.skip = p.skip;
-            if (!check(&p) || same(r) < p.reps)
+            for (unsigned k = 0; k < N_FLD; k++)
+                v[k] = bits(p.fld[k][0], p.fld[k][1]);
+            if (v[V_FIX] != p.fix_v || !check(&p) || same(r) < p.reps)
                 continue;
             /* the sanity checks of the rtl_433 decoders: a frame shifted by
              * a noise bit can pass a 4-bit check, and repeats as often */
-            const int16_t t = temperature(&p);
-            const uint8_t h = humidity(&p);
-            const uint8_t ch = (uint8_t)(p.ch_len ? bits(p.ch_pos, p.ch_len) : 0u);
+            const int16_t t = temperature(&p, v[V_T]);
+            const uint8_t h = humidity(&p, v[V_H]);
+            const uint8_t ch = (uint8_t)v[V_CH];
             if (t < -400 || t > 700 || ((p.flags & F_HREJ) && h > 100u) || ((p.flags & F_CHNZ) && !ch))
                 continue;
             sensor_t *const rd = g.rd;
             rd->proto = (uint8_t)i;
-            rd->id = (uint8_t)bits(p.id_pos, p.id_len);
+            rd->id = (uint8_t)v[V_ID];
             rd->ch = (uint8_t)(ch + (p.flags & F_CH1));
             rd->t10 = t;
             rd->hum = h && h <= 100u ? h : NO_HUM;
-            rd->low = (uint8_t)(bits(p.bat, 1) ^ ((p.flags & F_BATOK) ? 1u : 0u));
+            rd->low = (uint8_t)(v[V_BAT] ^ ((p.flags & F_BATOK) ? 1u : 0u));
             return true;
         }
     }
     return false;
 }
 
-__attribute__((noinline))
 static uint8_t decode(uint16_t n)
 {
     fam_t f;
@@ -810,13 +815,13 @@ static void draw(void)
         tail += 4u;
     asset((uint16_t)(BMP_TAIL + tail * TAIL_W), a->status_line + 64, TAIL_W);
     if (g.vhf) {
-        a->print_tiny(s + T_VHF1, 0, 17, false, true);
-        a->print_tiny(s + T_VHF2, 0, 25, false, true);
+        tiny(s + T_VHF1, 17);
+        tiny(s + T_VHF2, 25);
         return;
     }
 
     if (!g.n && !g.is_auto)            /* VFO, nothing heard yet: how to search */
-        a->print_tiny(s + T_HINT, 0, 17, false, true);
+        tiny(s + T_HINT, 17);
     const uint32_t now = a->ticks_ms();
     const sensor_t *e = g.tab + g.top;
     for (uint8_t r = 0; r < ROWS_SHOWN && (uint8_t)(g.top + r) < g.n; r++, e++) {
@@ -834,7 +839,7 @@ static void draw(void)
         if (e->low)
             b[31] = '!';
         b[32] = 0;
-        a->print_tiny(b, 0, (uint8_t)(r * 8u + 1u), false, true);
+        tiny(b, (uint8_t)(r * 8u + 1u));
         if ((uint8_t)(g.top + r) == g.sel)
             for (unsigned x = 0; x < 128u; x++)
                 a->fb[r][x] ^= 0xFFu;
@@ -878,7 +883,8 @@ static void draw(void)
     a->print_inverse(v, (uint8_t)(127u - 4u * (unsigned)(ve - v)), 6, false, true, 127);
     for (unsigned x = 0; x < 128u; x += 2u)
         a->fb[6][x] |= 0x01u;
-    tiny(b, o, 50);
+    *o = 0;
+    tiny(b, 50);
 }
 
 /* ---- keys ------------------------------------------------------------------- */
@@ -956,9 +962,9 @@ void app_main(const app_api_t *api)
     g.vfo = api->rx_freq();
     g.vhf = g.vfo < VHF_MAX;
     g.is_auto = g.vfo >= F_FIRST && g.vfo <= F_FIRST + (N_PTS - 1u) * F_STEP;
-    g.reg2b = api->bk_read(REG_2B);    /* the loader's retune leaves it in AM */
+    const uint16_t reg2b = api->bk_read(REG_2B);   /* the loader's retune leaves it in AM */
     api->bk_write(REG_RX_BW, WIDE_BW);
-    api->bk_write(REG_2B, (uint16_t)((g.reg2b | 0x0700u) & ~0x0007u));   /* RX filters off */
+    api->bk_write(REG_2B, (uint16_t)((reg2b | 0x0700u) & ~0x0007u));   /* RX filters off */
     api->bk_write(REG_73, (uint16_t)(api->bk_read(REG_73) | 0x0010u));   /* AFC off */
     api->set_agc(false);               /* fixed gain: steady RSSI and pulse levels */
     g.ctrl = (uint16_t)(api->bk_read(REG_CTRL) | CTRL_AF_DAC);
@@ -995,6 +1001,6 @@ void app_main(const app_api_t *api)
     api->set_af(APP_AF_MUTE);
     api->audio_path(false);
     api->set_agc(true);                /* its retune keeps a cached AGC state */
-    api->bk_write(REG_2B, g.reg2b);
+    api->bk_write(REG_2B, reg2b);
     api->led(false);
 }

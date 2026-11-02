@@ -188,6 +188,37 @@ proto("EMOS", 6, (120, 120), 0, F_CH1 | F_BATOK, 1, BYTE_SUM, (104, 104, 8),
 
 assert len(P) <= 16
 
+# ---- the PROTOS record (proto_t in temp433_app.c, 32 B) --------------------------
+# Positions from the row start: the skipped bits are added to every field but
+# the fixed bits, and to the check field; the checked bits (c1, the csub
+# nibble) count from the first data bit, check() adds the skip to them.
+FIELDS = ("fix", "id", "ch", "bat", "t", "h")        # V_FIX .. V_H
+ROW_BITS = 128                                       # ROWS_BYTES x 8
+
+def pack(entry):
+    (name, fam, (bmin, bmax), skip, flags, reps, (ck, ca, cb, cc, per8, sub), (c1, cpos, cw), fixed, ident, ch,
+     bat, (tpos, tfl, toff), hum) = entry
+    fp, fl, fv = fixed or (0, 0, 0)
+    fld = [(fp, fl), (ident[0] + skip, ident[1]), (ch[0] + skip, ch[1]), (bat + skip, 1), (tpos + skip, 12),
+           (hum[0] + skip, hum[1])]
+    fld = [(pos if n else 0, n) for pos, n in fld]
+    r = dict(fam=fam, bmin=bmin, bmax=bmax, skip=skip, flags=flags, reps=reps, check=ck, c1=c1, cpos=cpos + skip,
+             cw=cw, ca=ca, cb=cb, cc=cc, cfl=int(per8), fld=fld, fix_v=fv, t_fl=tfl, t_off=toff, csub=sub)
+    assert all(0 <= v < 256 for k, v in r.items() if k not in ("fld", "fix_v")), name
+    assert all(n <= 16 and pos + n <= ROW_BITS for pos, n in fld), name
+    assert bmax < ROW_BITS and cw <= 8 and r["cpos"] + cw <= ROW_BITS, name
+    assert skip + max(c1, 40 if sub != NO_SUB else 0) <= ROW_BITS, name
+    assert 0 <= fv < 1 << fl and len(name) < NAME_W, name
+    assert sub == NO_SUB or 4 * sub + 4 <= c1, name   # the nibble is one of the checked
+    return r
+
+def blob(r):
+    return struct.pack("<14B12BH4B", r["fam"], r["bmin"], r["bmax"], r["skip"], r["flags"], r["reps"],
+                       r["check"], r["c1"], r["cpos"], r["cw"], r["ca"], r["cb"], r["cc"], r["cfl"],
+                       *(v for f in r["fld"] for v in f), r["fix_v"], r["t_fl"], r["t_off"], r["csub"], 0)
+
+RECORDS = [pack(e) for e in P]
+
 # ---- self-check of the check constants ------------------------------------------
 # The CRCs and the LFSR digest as their sources define them, and the plain
 # nibble and byte sums, against the loop of check() in temp433_app.c, on
@@ -201,21 +232,19 @@ def _field(b, pos, n):
         v = v << 1 | b[pos + i]
     return v
 
-def _check(check, c, b, skip):
-    """check() in temp433_app.c"""
-    kind, key0, x, gi, per8, sub = check
-    c1, cpos, cw = c
-    key = key0
-    for pos in range(c1):
-        q = 36 + (pos & 3) if (pos >> 2) == sub else pos
-        if b[skip + q]:
-            x = (x + key) & 0xFFFF if kind == C_SUM else x ^ key
-        key = (key >> 1) ^ gi if key & 1 else key >> 1
-        if per8 and (pos & 7) == 7:
-            key = key0
-    if kind == C_SUM and not x:
+def _check(r, b):
+    """check() in temp433_app.c, on the packed record r"""
+    x, key = r["cb"], r["ca"]
+    for pos in range(r["c1"]):
+        q = 36 + (pos & 3) if (pos >> 2) == r["csub"] else pos
+        if b[r["skip"] + q]:
+            x = (x + key) & 0xFFFF if r["check"] == C_SUM else x ^ key
+        key = (key >> 1) ^ r["cc"] if key & 1 else key >> 1
+        if r["cfl"] & 1 and (pos & 7) == 7:
+            key = r["ca"]
+    if r["check"] == C_SUM and not x:
         return False
-    return (x & ((1 << cw) - 1)) == _field(b, skip + cpos, cw)
+    return (x & ((1 << r["cw"]) - 1)) == _field(b, r["cpos"], r["cw"])
 
 def _sum(b, skip, c1, w):
     """the w-bit units of the first c1 bits added up, the last one zero padded"""
@@ -246,17 +275,17 @@ for _ in range(64):
     for _ in range(16):                   # EMOS: 120 bits
         seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
         m.append(seed >> 16 & 0xFF)
-    for name, fam, _, skip, _, _, check, c, *_ in P:
+    for (name, fam, _, skip, _, _, check, c, *_), r in zip(P, RECORDS):
         if check[0] == C_SUM:
             c1, cpos, cw = c
             b = _bits(m)
             s = _sum(b, skip, c1, check[1].bit_length())   # key 8: nibbles, 128: bytes
             for i in range(cw):
                 b[skip + cpos + i] = s >> (cw - 1 - i) & 1
-            assert _check(check, c, b, skip), name
+            assert _check(r, b), name
             b[19] ^= 1                    # one bit off: the check must fail
-            assert not _check(check, c, b, skip), name
-            assert not _check(check, c, [0] * len(b), skip), name   # all zero
+            assert not _check(r, b), name
+            assert not _check(r, [0] * len(b)), name   # all zero
             continue
         if check[0] != C_DIGEST:
             continue
@@ -271,24 +300,14 @@ for _ in range(64):
             f[4] = _lfsr_reflect(f[:4], 0x31, 0xF4)
         elif name == "AUR-HG02":
             f[4] = _crc([f[0] ^ f[1] ^ f[2] ^ f[3]], 0x31, 0x53, 8)
-        assert _check(check, c, _bits(f), skip), name
+        assert _check(r, _bits(f)), name
         f[2] ^= 0x10                      # one bit off: the check must fail
-        assert not _check(check, c, _bits(f), skip), name
+        assert not _check(r, _bits(f)), name
 
 fam_blob = b"".join(struct.pack("<8B", kind, thr, brk, end, glitch, pulse, pmax, 0)
                     for (_, kind, thr, brk, end, glitch, pulse, pmax) in FAMILIES)
-proto_blob = b""
-for (name, fam, (bmin, bmax), skip, flags, reps, (ck, ca, cb, cc, per8, sub), (c1, cpos, cw), fixed, ident, ch,
-     bat, (tpos, tfl, toff), hum) in P:
-    fp, fl, fv = fixed or (0, 0, 0)
-    assert all(0 <= v < 256 for v in (bmin, bmax, skip, ca, cb, cc, sub, c1, cpos, cw, fp, fl, bat, toff))
-    assert bmax <= 127 and fl <= 16 and cw <= 8 and len(name) < NAME_W
-    assert sub == NO_SUB or 4 * sub + 4 <= c1          # the nibble is one of the checked
-    proto_blob += struct.pack("<32B", fam, bmin, bmax, skip, flags, reps,
-                              ck, c1, cpos, cw, ca, cb, cc, per8,
-                              fp, fl, fv >> 8, fv & 0xFF,
-                              ident[0], ident[1], ch[0], ch[1], bat,
-                              tpos, tfl, toff, hum[0], hum[1], sub, 0, 0, 0)
+proto_blob = b"".join(blob(r) for r in RECORDS)
+assert len(proto_blob) == 32 * len(P)
 
 a = Assets("TEMP433")
 ui_size = 0
