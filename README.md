@@ -10,7 +10,7 @@ A receive-only overlay app for the
 
 ## Features
 
-- Reads 11 kinds of 433 MHz thermometers and thermo-hygrometers (see
+- Reads 19 kinds of 433 MHz thermometers and thermo-hygrometers (see
   [Supported sensors](#supported-sensors)).
 - A table of up to 12 sensors: model, channel, ID, temperature, humidity, the
   time since the last reading, and a low battery mark.
@@ -127,15 +127,23 @@ On VHF the app asks you to tune the VFO to 433.920 first.
 | INFACTORY | inFactory-TH | nor-tec, FreeTec NC-3982 |
 | TX141TH | LaCrosse-TX141THBv2 | TFA 30.3221 |
 | BRESSER | Bresser-3CH | Renkforce DM-7511 |
+| ST1005H | Bresser-ST1005H | Bresser Explore Scientific ST1005H, Bresser 3CH 7009984 |
 | EMOS | EMOS-E6016, EMOS-E6018 | |
+| ALECTOV1 | AlectoV1-Temperature | Alecto WS3500/WS4500, Ventus W044/W155 |
+| TFA-TWIN | TFA-TwinPlus | TFA 30.3049, Conrad KW9010, Ea2 BL999 |
+| ESPERANZA | Esperanza-EWS, Kedsum-TH, Conrad-S3318P | Esperanza EWS-103, Pearl NC-7415, FreeTec NC-5849 |
+| VAUNO | Vauno-EN8822C | ESUN T21 |
+| TX960 | Acurite-606TX | Technoline TX960 |
+| GT-WT-03 | GT-WT03 | Globaltronics (Aldi, Hofer) |
+| LACROSSE | LaCrosse-TX | La Crosse TX3, TX4, TX6U, TX7U, TFA 30.3120, 30.3121 |
 
-Not supported: 868 MHz sensors, Manchester-coded ones (Oregon Scientific,
-Hideki, Ambient Weather F007TH), AlectoV1, Esperanza EWS and La Crosse TX3.
+Not supported: 868 MHz sensors and Manchester-coded ones (Oregon Scientific,
+Hideki, Ambient Weather F007TH).
 
 The frame formats come from the device notes of
 [rtl_433](https://github.com/merbanan/rtl_433), thanks to its authors.
 Channels and IDs are shown the way rtl_433 shows them, so the two can be
-compared side by side.
+compared side by side, except for TFA-TWIN (see below).
 
 ## Limitations
 
@@ -145,6 +153,12 @@ compared side by side.
   show as `10%` and `--`.
 - Nexus, Prologue and Auriol AFW 2 A1 send no checksum: a reading counts once
   the same frame comes twice.
+- TFA-TWIN shows the whole first byte as its ID, channel bits included; rtl_433
+  leaves those out, so its ID is another number for the same sensor.
+- LACROSSE shows the temperature only (the humidity comes in separate frames)
+  and channel 0 (these sensors have none).
+- ESPERANZA also reads Kedsum and Conrad S3318P sensors (the same frame); the
+  battery state of a Kedsum may be shown wrongly.
 - The table keeps 12 sensors; a new one then replaces the one heard longest
   ago. The table is not kept after the app exits.
 
@@ -158,7 +172,8 @@ chosen sensitivity above that noise starts a capture: the audio is sampled at
 20 kHz until it goes quiet. The capture is cut into pulses and gaps, decoded
 as pulse-position (PPM) or pulse-width (PWM) bits, and matched against a table
 of protocols. One loop runs every checksum of the table: nibble and byte sums,
-CRC-4, CRC-8 and the LFSR digest.
+CRC-4, CRC-8 and the LFSR digests. Fields sent least significant bit first or
+with their nibbles swapped are read in that order from the table, too.
 
 ## Build
 

@@ -26,10 +26,10 @@ command -v "$CC" >/dev/null 2>&1 || { echo "❌ ARM compiler not found: $CC"; ex
 command -v "$OBJCOPY" >/dev/null 2>&1 || { echo "❌ ARM objcopy not found: $OBJCOPY"; exit 1; }
 
 # SIZE: optimisations that grow this code on Thumb-1 (more live registers,
-# more spills), switched off: -140 B on GCC 13.3, each flag measured on its
+# more spills), switched off: -148 B on GCC 13.3, each flag measured on its
 # own. Measure them again after a bigger change.
 SIZE="-fno-ipa-pure-const -fno-ipa-sra -fno-move-loop-invariants -fno-jump-tables \
-  -fno-tree-forwprop -fno-tree-sink"
+  -fno-tree-forwprop -fno-tree-sink -fno-code-hoisting"
 CFLAGS="-mcpu=cortex-m0plus -mthumb -Os -std=gnu11 -ffreestanding -fno-builtin -fno-common \
   -fomit-frame-pointer -ffunction-sections -fdata-sections $SIZE -Wall -Wextra -I$SDK -I."
 LDFLAGS="-nostdlib -nostartfiles -T app.ld -Wl,--defsym,APP_VMA=${APP_VMA} \

@@ -86,7 +86,7 @@ TREND = [[0x20, 0x30, 0x38, 0x30, 0x20],    # up
 #     (off).  One family per timing, the thresholds halfway (a shared one left
 #     too little margin, e.g. the HG02832 long pulse of 612 us against the
 #     Bresser sync pulse of 750 us).
-PPM, PWM = 0, 1
+PPM, PWM, PWM_SHORT1 = 0, 1, 3
 FAMILIES = [
     ("PPM 1000/2000", PPM, s(1500), s(3000), 255, 3, s(500), s(800)),   # Rubicson, Nexus: sync 4000
     ("PPM 2000/4000", PPM, s(3100), s(6500), 255, 3, s(500), s(800)),   # AHFL 2100/4150, GT-WT-02 2500/5000: sync >= 8000
@@ -95,14 +95,16 @@ FAMILIES = [
     ("PWM 250/500",   PWM, mid(250, 500), mid(500, 750), s(1000), 2, 0, 255),   # Bresser 3CH: sync 750
     ("PWM 252/612",   PWM, mid(252, 612), mid(612, 860), s(1000), 2, 0, 255),   # HG02832: sync 860
     ("PWM 280/796",   PWM, mid(280, 796), mid(796, 1836), s(1200), 2, 0, 255),  # EMOS: sync 1836, gaps <= 796
+    ("PWM 550/1400",  PWM_SHORT1, mid(550, 1400), 255, s(2000), 2, 0, 255),     # La Crosse TX: gap 1000, no sync
 ]
 
 # ---- checks -------------------------------------------------------------------
-# (kind, ca, cb, cc, per8, sub): check() in temp433_app.c runs one loop for
+# (kind, ca, cb, cc, cfl, sub): check() in temp433_app.c runs one loop for
 # both kinds, x from cb, x += key (C_SUM) or x ^= key (C_DIGEST) for every 1
 # of the first c1 bits, the key from ca stepped back after each bit as an
-# LFSR with cc; per8: the key starts over every 8 bits; nibble `sub` read from
-# bits 36-39 (NO_SUB: none).
+# LFSR with cc; cfl bit 0: the key starts over every 8 bits, bit 3: the key
+# is ca << 8 (pack() adds bits 6-7 for F_LSB); nibble `sub` read from bits
+# 36-39 (NO_SUB: none).
 C_NONE, C_SUM, C_DIGEST = range(3)
 NO_SUB = 0xFF
 
@@ -137,17 +139,28 @@ def lfsr_digest(gen, key, length):
         key = _step(key, gen, 8)
     return (C_DIGEST, key, 0, (gen >> 1) | 0x80, 0, NO_SUB)
 
+def lfsr_digest_fwd(gen, key):
+    """C_DIGEST constants of an LFSR digest that takes the bits first to last,
+    MSB first, the key stepped right with gen XORed in after a 1 dropped out:
+    the loop of check() itself"""
+    return (C_DIGEST, key, 0, gen, 0, NO_SUB)
+
 # temperature: t_fl flags, t_off x 10 below 0 C (0.1 C) or below 32 F (0.1 F)
-T_SIGNED, T_F = 1, 8
+T_SIGNED, T_DEC, T_F = 1, 4, 8
+T_LE = 2                          # the temperature nibbles last to first: pack() only (x 12)
 S12 = (T_SIGNED, 0)
 F900 = (T_F, 122)                # 0.1 F + 900, i.e. 1220 below 32 F
 F_CH1, F_BATOK, F_HBCD = 1, 2, 8
+F_HSWAP = 4                       # the humidity nibbles swapped: pack() only (x 4)
 F_HREJ, F_CHNZ = 16, 32           # rtl_433 drops a frame with a humidity over 100 % / channel 0
+F_LSB = 64                        # the fields of 4 bits or more LSB first, the nibbles of the check too:
+                                  # pack() only (x 3/7/15, cfl)
+F_FIXNE = 128                     # the fixed bits must NOT hold the value
 
 # name (<= 9 chars), family, bits min/max, skip, flags, repeats,
-# check (kind, ca, cb, cc, per8, sub) with c1 (bits checked), cpos and cw (the check field),
+# check (kind, ca, cb, cc, cfl, sub) with c1 (bits checked), cpos and cw (the check field),
 # fixed (pos, len, value) from the row start, id (pos, len), channel (pos, len),
-# battery bit, temp (pos, flags, offset), hum (pos, bits)
+# battery bit, temp (pos, flags, offset), hum (pos, bits[, offset subtracted])
 P = []
 def proto(name, fam, bits, skip, flags, reps, check, c, fixed, ident, ch, bat, temp, hum):
     P.append((name, fam, bits, skip, flags, reps, check, c, fixed, ident, ch, bat, temp, hum))
@@ -164,13 +177,50 @@ proto("NEXUS", 0, (36, 37), 0, F_CH1 | F_BATOK | F_HREJ, 2, NOCHECK, (0, 0, 0),
 # PPM 2000/4000
 proto("AUR-AHFL", 1, (42, 42), 0, F_CH1 | F_BATOK, 1, NIBBLE_SUM, (36, 36, 6),
       (31, 5, 0x04), (0, 8), (10, 2), 8, (12,) + S12, (24, 7))     # Lidl Auriol AHFL 433B2
+# Esperanza, Kedsum and Conrad S3318P share this frame: 2 zero bits, then the
+# CRC-4 of inFactory over bytes 0-3, XORed with nibble 32, in nibble 36 (c1 =
+# 36: the digest of those 4 bits is the nibble itself); the temperature
+# (0.1 F + 900) nibbles last to first, the humidity nibbles swapped.  F_HREJ beyond
+# rtl_433, against the 42-bit frames of the other decoders here.  Before
+# INFACTORY: a frame of either rarely passes the other's CRC.
+proto("ESPERANZA", 1, (42, 42), 2, F_CH1 | F_HSWAP | F_HREJ, 2, crc_digest(0x3, 4, 32), (36, 36, 4),
+      (0, 2, 0), (0, 8), (10, 2), 33, (12, T_LE | T_F, 122), (24, 8))   # + Kedsum, Conrad S3318P
 proto("INFACTORY", 1, (40, 42), 0, F_HBCD | F_HREJ | F_CHNZ, 2, crc_digest(0x3, 4, 32, sub=2), (36, 8, 4),
       None, (0, 8), (38, 2), 13, (16,) + F900, (28, 8))            # + nor-tec, FreeTec NC-3982;
                                                                    # its CRC-4 0x13 is 0x3 in 4 bits
+proto("VAUNO", 1, (42, 44), 0, F_CH1, 2, NIBBLE_SUM, (36, 36, 6),
+      None, (0, 8), (10, 2), 35, (12,) + S12, (24, 7))             # Vauno EN8822C, ESUN T21: 9 nibbles mod 64
+# TX960: the digest of an all-zero row is 0, so a zero row (a PWM frame read
+# as PPM) would pass; rtl_433 drops it too, here as 15 fixed bits that must
+# not all be 0 (ID 0 with a low battery would go as well)
+proto("TX960", 1, (32, 33), 0, F_CH1 | F_BATOK | F_FIXNE, 2, lfsr_digest_fwd(0x98, 0xF1), (24, 24, 8),
+      (0, 15, 0), (0, 8), (10, 2), 8, (12,) + S12, (0, 0))         # Technoline TX960, Acurite 606TX
+proto("ST1005H", 1, (38, 38), 1, F_CH1 | F_HREJ, 2, NIBBLE_SUM, (31, 31, 6),
+      (0, 1, 0), (0, 8), (10, 2), 8, (12,) + S12, (24, 7))         # Bresser ST1005H / 3CH 7009984: a 0 first,
+                                                                   # its sum leaves out the last data bit
 proto("GT-WT-02", 1, (37, 37), 0, F_CH1, 1, NIBBLE_SUM, (31, 31, 6),
       None, (0, 8), (10, 2), 8, (12,) + S12, (24, 7))              # Aldi Globaltronics
 proto("GT-WT-02", 1, (39, 39), 2, F_CH1, 1, NIBBLE_SUM, (31, 31, 6),
       None, (0, 8), (10, 2), 8, (12,) + S12, (24, 7))              # Lidl AURIO YJ-T12: 2 extra bits
+# AlectoV1 sends its values LSB first (rtl_433 reverses each byte); its
+# 2-bit channel is read as sent, as rtl_433 does.  Type 11 (bits 9-10) is
+# wind or rain, whose wind messages pass the same check: F_FIXNE drops them.
+# The check C = 0xF - (the sum of the 8 nibbles), LSB first: c1 = 36 takes C
+# into the sum, so 1 + S + C = 16 when it holds, compared with bits 36-39,
+# the zeros after the 36-bit row.  rtl_433: "prologue is also 36bits and
+# sometimes detected as alecto", hence the humidity check, and before PROLOGUE.
+proto("ALECTOV1", 1, (36, 36), 0, F_LSB | F_FIXNE | F_HBCD | F_HREJ, 2, (C_SUM, 8, 1, 8, 0, NO_SUB), (36, 36, 4),
+      (9, 2, 0x3), (0, 8), (4, 2), 8, (12,) + S12, (24, 8))      # Alecto WS3500/WS4500, Ventus W044/W155
+# TFA Twin Plus: LSB first as AlectoV1 (rtl_433 reverses each byte), the
+# nibble sum of the reversed bytes 0-3 against the low nibble of reversed b4
+# (bits 32-35 LSB first); humidity 7 bits - 28.  rtl_433's 6-bit ID leaves
+# out the channel bits in the middle of byte 0: here the whole reversed byte
+# 0 (the same sensors told apart, other numbers).  A negative temperature has
+# its 3 top bits set (9 bits + sign in rtl_433), a 12-bit two's complement.
+# After ALECTOV1, whose checks are stronger; its 4-bit sum lets about 1 of
+# 16 Prologue frames through (the humidity check stops some).
+proto("TFA-TWIN", 1, (36, 36), 0, F_LSB | F_HREJ, 2, NIBBLE_SUM, (32, 32, 4),
+      None, (0, 8), (4, 2), 8, (12,) + S12, (24, 7, 28))            # TFA 30.3049, Conrad KW9010, Ea2 BL999
 proto("PROLOGUE", 1, (36, 37), 0, F_CH1 | F_BATOK, 2, NOCHECK, (0, 0, 0),
       (2, 2, 0x1), (4, 8), (14, 2), 12, (16,) + S12, (28, 8))      # type 9/5; + ThermoPro TX2
 # PPM 576/1536
@@ -183,39 +233,75 @@ proto("BRESSER", 4, (40, 42), 0, F_HREJ | F_CHNZ, 1, BYTE_SUM, (32, 32, 8),
       None, (0, 8), (10, 2), 8, (12,) + F900, (24, 8))             # Bresser 3CH, Renkforce DM-7511
 proto("AUR-HG02", 5, (40, 40), 0, F_CH1, 1, crc_digest(0x31, 8, 8, 0x53, per8=True), (32, 32, 8),
       None, (0, 8), (18, 2), 16, (20,) + S12, (8, 8))              # Lidl Auriol HG02832 / HG05124A
+# GT-WT-03: rtl_433's rollbyte, per byte the bits MSB first weighted by the
+# low byte of 0x3100 shifted right (00 80 40 20 10 88 C4 62), XORed, ^ 0x2D;
+# here a 16-bit key ca << 8 (cfl bit 3) with cc 0, restarted every byte
+proto("GT-WT-03", 5, (41, 41), 0, F_CH1, 2, (C_DIGEST, 0x31, 0x2D, 0, 1 | 8, NO_SUB), (32, 32, 8),
+      None, (0, 8), (18, 2), 16, (20,) + S12, (8, 8))              # Globaltronics GT-WT-03 (Aldi, Hofer)
 proto("EMOS", 6, (120, 120), 0, F_CH1 | F_BATOK, 1, BYTE_SUM, (104, 104, 8),
-      (0, 16, 0xAAA5), (24, 8), (66, 2), 101, (68,) + S12, (80, 8))   # EMOS E6016 / E6018
+      (1, 15, 0x2AA5), (24, 8), (66, 2), 101, (68,) + S12, (80, 8))   # EMOS E6016 / E6018 (preamble
+                                                                   # 0xAAA5 less its first bit: 15-bit fields)
 
-assert len(P) <= 16
+# PWM 550/1400 (a short pulse is 1, as rtl_433 reads it): La Crosse TX3 and
+# kin, 11 nibbles 0 A type id(7) parity v1 v2 v3 v1 v2 sum; type 0 is the
+# temperature (decimal, + 50 C); the humidity messages (type E) are left out
+proto("LACROSSE", 7, (44, 44), 0, 0, 1, NIBBLE_SUM, (40, 40, 4),
+      (0, 12, 0x0A0), (12, 7), (0, 0), 0, (20, T_DEC, 50), (0, 0))      # La Crosse TX3/TX4/TX6U/TX7U: temperature
+
+assert len(P) <= 24                 # an arbitrary bound: match() reads them all per family
 
 # ---- the PROTOS record (proto_t in temp433_app.c, 32 B) --------------------------
 # Positions from the row start: the skipped bits are added to every field but
 # the fixed bits, and to the check field; the checked bits (c1, the csub
 # nibble) count from the first data bit, check() adds the skip to them.
 FIELDS = ("fix", "id", "ch", "bat", "t", "h")        # V_FIX .. V_H
+V_T, V_H = 4, 5
 ROW_BITS = 128                                       # ROWS_BYTES x 8
 
 def pack(entry):
-    (name, fam, (bmin, bmax), skip, flags, reps, (ck, ca, cb, cc, per8, sub), (c1, cpos, cw), fixed, ident, ch,
+    (name, fam, (bmin, bmax), skip, flags, reps, (ck, ca, cb, cc, cfl, sub), (c1, cpos, cw), fixed, ident, ch,
      bat, (tpos, tfl, toff), hum) = entry
     fp, fl, fv = fixed or (0, 0, 0)
     fld = [(fp, fl), (ident[0] + skip, ident[1]), (ch[0] + skip, ch[1]), (bat + skip, 1), (tpos + skip, 12),
            (hum[0] + skip, hum[1])]
     fld = [(pos if n else 0, n) for pos, n in fld]
     r = dict(fam=fam, bmin=bmin, bmax=bmax, skip=skip, flags=flags, reps=reps, check=ck, c1=c1, cpos=cpos + skip,
-             cw=cw, ca=ca, cb=cb, cc=cc, cfl=int(per8), fld=fld, fix_v=fv, t_fl=tfl, t_off=toff, csub=sub)
+             cw=cw, ca=ca, cb=cb, cc=cc, cfl=int(cfl), fld=fld, fix_v=fv, t_fl=tfl, t_off=toff, csub=sub,
+             h_off=hum[2] if len(hum) > 2 else 0)
     assert all(0 <= v < 256 for k, v in r.items() if k not in ("fld", "fix_v")), name
-    assert all(n <= 16 and pos + n <= ROW_BITS for pos, n in fld), name
+    assert all(n <= 15 and pos + n <= ROW_BITS for pos, n in fld), name   # n: 4 bits of the length byte
     assert bmax < ROW_BITS and cw <= 8 and r["cpos"] + cw <= ROW_BITS, name
     assert skip + max(c1, 40 if sub != NO_SUB else 0) <= ROW_BITS, name
     assert 0 <= fv < 1 << fl and len(name) < NAME_W, name
     assert sub == NO_SUB or 4 * sub + 4 <= c1, name   # the nibble is one of the checked
+    # Field order (bits(): bit i of a field is row bit pos + (i ^ x), the
+    # length byte n | x << 4): LSB first, a window of 4, 8 or 16 bits ending at
+    # the field's end read backwards; nibbles swapped (8 bits) or last to first
+    # (12 bits, a 16-bit window from 4 bits before the field).
+    def order(pos, n, lsb, x=0):
+        if lsb and n >= 4:
+            w = 4 if n <= 4 else 8 if n <= 8 else 16
+            pos, x = pos - (w - n), w - 1
+        assert pos >= 0 and pos + (x | (n - 1)) < ROW_BITS, name
+        return pos, n | x << 4
+    lsb = flags & F_LSB
+    r["fld"] = [order(pos, n, lsb) for pos, n in fld]
+    if tfl & T_LE:
+        r["fld"][V_T] = order(fld[V_T][0] - 4, 12, False, 12)
+    if flags & F_HSWAP:
+        assert fld[V_H][1] == 8, name
+        r["fld"][V_H] = order(fld[V_H][0], 8, False, 4)
+    r["cpos"], r["cw"] = order(r["cpos"], cw, lsb)
+    if lsb:
+        r["cfl"] |= 3 << 6            # check() XORs the bit index with 3: the nibble weights reversed
+    r["flags"] &= ~(F_LSB | F_HSWAP)  # the order is in the fields now
+    r["t_fl"] &= ~T_LE
     return r
 
 def blob(r):
     return struct.pack("<14B12BH4B", r["fam"], r["bmin"], r["bmax"], r["skip"], r["flags"], r["reps"],
                        r["check"], r["c1"], r["cpos"], r["cw"], r["ca"], r["cb"], r["cc"], r["cfl"],
-                       *(v for f in r["fld"] for v in f), r["fix_v"], r["t_fl"], r["t_off"], r["csub"], 0)
+                       *(v for f in r["fld"] for v in f), r["fix_v"], r["t_fl"], r["t_off"], r["csub"], r["h_off"])
 
 RECORDS = [pack(e) for e in P]
 
@@ -227,24 +313,27 @@ def _bits(frame):
     return [(frame[i >> 3] >> (7 - (i & 7))) & 1 for i in range(8 * len(frame))]
 
 def _field(b, pos, n):
+    """bits() in temp433_app.c: bit i of the field is b[pos + (i ^ x)], n = n | x << 4"""
     v = 0
-    for i in range(n):
-        v = v << 1 | b[pos + i]
+    for i in range(n & 15):
+        v = v << 1 | b[pos + (i ^ (n >> 4))]
     return v
 
 def _check(r, b):
     """check() in temp433_app.c, on the packed record r"""
-    x, key = r["cb"], r["ca"]
+    k0 = r["ca"] << (r["cfl"] & 8)
+    x, key = r["cb"], k0
     for pos in range(r["c1"]):
         q = 36 + (pos & 3) if (pos >> 2) == r["csub"] else pos
+        q ^= r["cfl"] >> 6
         if b[r["skip"] + q]:
             x = (x + key) & 0xFFFF if r["check"] == C_SUM else x ^ key
         key = (key >> 1) ^ r["cc"] if key & 1 else key >> 1
         if r["cfl"] & 1 and (pos & 7) == 7:
-            key = r["ca"]
+            key = k0
     if r["check"] == C_SUM and not x:
         return False
-    return (x & ((1 << r["cw"]) - 1)) == _field(b, r["cpos"], r["cw"])
+    return (x & ((1 << (r["cw"] & 15)) - 1)) == _field(b, r["cpos"], r["cw"])
 
 def _sum(b, skip, c1, w):
     """the w-bit units of the first c1 bits added up, the last one zero padded"""
@@ -269,6 +358,35 @@ def _lfsr_reflect(msg, gen, key):
             key = ((key << 1) ^ gen) & 0xFF if key & 0x80 else (key << 1) & 0xFF
     return s
 
+def _rev(v, n):
+    return int(format(v, f"0{n}b")[::-1], 2)
+
+def _alecto(f):
+    """AlectoV1 as rtl_433 describes it: the nibbles of the reversed bytes 0-3
+    summed, C = 0xF - sum (rain: sum + 7), reversed into the high nibble of b4"""
+    s = sum((_rev(v, 8) & 0xF) + (_rev(v, 8) >> 4) for v in f[:4])
+    c = (s + 7) if (f[1] & 0x7F) == 0x6C else (0xF - s)
+    return _rev(c & 0xF, 4) << 4
+
+def _rollbyte(msg, gen):
+    s = 0
+    for byte in msg:
+        key = gen
+        for i in range(7, -1, -1):
+            if (byte >> i) & 1:
+                s ^= key & 0xFF
+            key >>= 1
+    return s
+
+def _lfsr_fwd(msg, gen, key):
+    s = 0
+    for byte in msg:
+        for i in range(7, -1, -1):
+            if (byte >> i) & 1:
+                s ^= key
+            key = (key >> 1) ^ gen if key & 1 else key >> 1
+    return s
+
 seed = 0x1234567
 for _ in range(64):
     m = []
@@ -276,6 +394,26 @@ for _ in range(64):
         seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
         m.append(seed >> 16 & 0xFF)
     for (name, fam, _, skip, _, _, check, c, *_), r in zip(P, RECORDS):
+        if name == "TFA-TWIN":            # the nibbles of the reversed bytes, into reversed b4
+            f = m[:4]
+            s = sum((_rev(v, 8) & 0xF) + (_rev(v, 8) >> 4) for v in f) & 0xF
+            b = _bits(f + [_rev(s, 8)])
+            assert _check(r, b), name
+            b[19] ^= 1
+            assert not _check(r, b), name
+            assert not _check(r, [0] * len(b)), name
+            continue
+        if name == "ALECTOV1":
+            f = m[:4] + [_alecto(m[:4])]
+            if (f[1] & 0x7F) == 0x6C:     # rain: + 7, and type 11 anyway
+                continue
+            b = _bits(f) + [0] * 8        # bits 36-39 and on: the zeros after the row
+            b[36:40] = [0, 0, 0, 0]
+            assert _check(r, b), name
+            b[19] ^= 1                    # one bit off: the check must fail
+            assert not _check(r, b), name
+            assert not _check(r, [0] * len(b)), name   # all zero
+            continue
         if check[0] == C_SUM:
             c1, cpos, cw = c
             b = _bits(m)
@@ -298,6 +436,15 @@ for _ in range(64):
             f[1] = (f[1] & 0x0F) | ((_crc(mm, 0x3, 0, 4) ^ (f[4] >> 4)) & 0xF) << 4
         elif name == "TX141TH":
             f[4] = _lfsr_reflect(f[:4], 0x31, 0xF4)
+        elif name == "ESPERANZA":         # 2 leading bits, then 40: the CRC ^ nibble 32 = nibble 36
+            d = [(f[k] << 2 | f[k + 1] >> 6) & 0xFF for k in range(4)]
+            nib = (_crc(d, 0x3, 0, 4) ^ (f[4] >> 2 & 0xF)) & 0xF
+            f[4] = (f[4] & 0xFC) | nib >> 2
+            f[5] = (f[5] & 0x3F) | (nib & 3) << 6
+        elif name == "GT-WT-03":
+            f[4] = _rollbyte(f[:4], 0x3100) ^ 0x2D
+        elif name == "TX960":
+            f[3] = _lfsr_fwd(f[:3], 0x98, 0xF1)
         elif name == "AUR-HG02":
             f[4] = _crc([f[0] ^ f[1] ^ f[2] ^ f[3]], 0x31, 0x53, 8)
         assert _check(r, _bits(f)), name
@@ -317,18 +464,21 @@ for name, text in UI:
     ui_size += len(text) + 1 + pad
 a.const("UI_SIZE", ui_size)
 a.const("T_TITLE_CHARS", len(UI[0][1]))
-a.raw("T_NAME", b"".join(p[0].ljust(NAME_W).encode("ascii") for p in P))   # read into the row
-a.const("T_NAME_STRIDE", NAME_W)
+# The fixed blocks first, so as many offsets as fit stay below 256 (a movs in
+# Thumb-1, a literal word above); the per-protocol ones last, so a new
+# protocol moves no other offset.
 a.raw("FAMS", fam_blob)
 a.const("FAM_SIZE", 8)
 a.const("FAM_COUNT", len(FAMILIES))
+a.raw("BMP_BARS", b"".join(bytes(v) for v in BARS))
+a.const("BARS_W", len(BARS[0]))
+a.raw("BMP_TREND", b"".join(bytes(v) for v in TREND))
+a.const("TREND_W", len(TREND[0]))
+a.raw("BMP_TAIL", tails)
+a.const("TAIL_W", 18)
+a.raw("T_NAME", b"".join(p[0].ljust(NAME_W).encode("ascii") for p in P))   # read into the row
+a.const("T_NAME_STRIDE", NAME_W)
 a.raw("PROTOS", proto_blob)
 a.const("PROTO_SIZE", 32)
 a.const("PROTO_COUNT", len(P))
-a.raw("BMP_BARS", b"".join(bytes(v) for v in BARS))
-a.const("BARS_W", len(BARS[0]))
-a.raw("BMP_TAIL", tails)
-a.const("TAIL_W", 18)
-a.raw("BMP_TREND", b"".join(bytes(v) for v in TREND))
-a.const("TREND_W", len(TREND[0]))
 a.main()
