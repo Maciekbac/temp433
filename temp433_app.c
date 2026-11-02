@@ -18,7 +18,7 @@
  * Temp 433 - 433 MHz wireless temperature sensors, receive only: no tx_*
  * service of the API is called and the app never writes REG_33 (RF path, PA
  * enable) itself; api->led() rewrites it from the resident's GPIO state, only
- * the green LED bit changes.  Work in progress: the receiver, 12 decoders and
+ * the green LED bit changes.  Work in progress: the receiver, 20 decoders and
  * the sensor table.
  *
  * Receiver: the BK4829 in AM with the RX filters bypassed (RAW), AFC off, the
@@ -42,7 +42,8 @@
  * Decoders: one table record per protocol, no code of its own.  One loop
  * runs every check of the table: a sum of 4- or 8-bit units, or a linear
  * digest that covers every CRC and LFSR check (see check()); the temperature
- * and humidity encodings are flags.
+ * and humidity encodings are flags, the order of a field's bits (LSB first,
+ * nibbles swapped) part of its record (see bits()).
  *
  * Keys: UP/DOWN select a sensor (its frequency, level and temperature trend
  * in the bottom line), 1 speaker, 2 clear the table and the count of unknown
@@ -107,26 +108,36 @@ enum { EMPTY, PACKET, DECODED };
 #define F_HBCD      8u                 /* humidity in BCD                            */
 #define F_HREJ      16u                /* a humidity over 100 % rejects the frame    */
 #define F_CHNZ      32u                /* channel 0 rejects the frame                */
+#define F_FIXNE     128u               /* the fixed bits must not hold their value   */
 #define T_SIGNED    1u                 /* t_fl: 12-bit two's complement, 0.1 C       */
+#define T_DEC       4u                 /* three decimal digits                       */
 #define T_F         8u                 /* 0.1 F, t_off x 10 below 32 F               */
 #define NO_HUM      0xFFu
 
 typedef struct {                       /* FAMS record of the assets (8 B)            */
-    uint8_t kind;                      /* 0 PPM, 1 PWM (a long pulse is 1)           */
+    uint8_t kind;                      /* 0 PPM, 1 PWM (a long pulse is 1), 3 PWM    */
+                                       /* (a short pulse is 1)                       */
     uint8_t thr, brk, end;             /* bit threshold; a longer bit run ends the row (PPM: */
                                        /* a gap, PWM: a sync pulse); PWM: so does a  */
                                        /* gap longer than end, after its bit         */
     uint8_t glitch, pulse, pmax, pad;  /* PPM: a pulse longer than pmax is pulse plus noise */
 } fam_t;
 
+/* the fields of a frame, read in one loop by match(); a field of length 0
+ * reads as 0 */
+enum { V_FIX, V_ID, V_CH, V_BAT, V_T, V_H, N_FLD };
+
 typedef struct {                       /* PROTOS record of the assets (32 B)         */
     uint8_t fam, bmin, bmax, skip, flags, reps;
     uint8_t check, c1, cpos, cw, ca, cb, cc, cfl;      /* see check()               */
-    uint8_t fix_pos, fix_len, fix_hi, fix_lo;          /* from the row start         */
-    uint8_t id_pos, id_len, ch_pos, ch_len, bat;
-    uint8_t t_pos, t_fl, t_off, h_pos, h_len;
-    uint8_t csub, pad[3];              /* csub here: 12 B less code than after cfl */
+    uint8_t fld[N_FLD][2];             /* (pos, len | x << 4) of each field, from   */
+                                       /* the row start (gen_assets.py adds the     */
+                                       /* skipped bits to all but the fixed bits;   */
+                                       /* cpos too): see bits()                     */
+    uint16_t fix_v;                    /* the value the fixed bits must hold         */
+    uint8_t t_fl, t_off, csub, h_off;  /* h_off: subtracted from the humidity field  */
 } proto_t;
+_Static_assert(sizeof(fam_t) == FAM_SIZE && sizeof(proto_t) == PROTO_SIZE, "the records of gen_assets.py");
 
 typedef struct {
     uint8_t bytes[ROWS][ROW_BYTES];
@@ -150,9 +161,9 @@ typedef struct {                       /* a reading, and a row of the sensor tab
  * fields first so their offsets fit ldrb's immediate.  The loader zeroes the
  * overlay at every launch. */
 static struct {
-    uint8_t running, prev, saver, sens, spk, vhf, is_auto, pt, nrows, off, skip, hold_pt, aborted, pkt;
+    uint8_t running, prev, saver, sens, spk, vhf, is_auto, pt, nrows, off, hold_pt, aborted, pkt;
     uint8_t n, sel, top;               /* table: sensors, selected, first shown     */
-    uint16_t reg2b, ctrl, unk;         /* unk: packets no protocol took             */
+    uint16_t ctrl, unk;                /* unk: packets no protocol took             */
     uint32_t vfo, f0, armed, hold_until, led_until, next_draw;  /* led_until 0: LED off */
     sensor_t *tab;                     /* [N_SENS] on app_main's stack, and after   */
     sensor_t *rd;                      /* them the reading match() decodes          */
@@ -228,9 +239,10 @@ static char *put_freq(char *o, uint32_t f)
     return o[-1] == '0' ? o - 1 : o;
 }
 
-static void tiny(char *s, char *end, uint8_t y)
+/* the 3x5 font from the left edge, not inverted */
+__attribute__((noinline))
+static void tiny(const char *s, uint8_t y)
 {
-    *end = 0;
     A->print_tiny(s, 0, y, false, true);
 }
 
@@ -269,12 +281,13 @@ static uint8_t measure(void)
 }
 
 /* noise floor of point p toward v by 1/2^shift of the difference (truncated
- * toward zero: no drift either way) */
+ * toward zero: no drift either way; s = 0 or -1, (d ^ s) - s is |d|, and the
+ * same again gives the sign back) */
 static void learn(uint8_t p, uint8_t v, uint8_t shift)
 {
     uint16_t *const q = &g.floorq[p];
-    const int32_t d = (int32_t)(v << 8) - *q;
-    *q = (uint16_t)(*q + (d >= 0 ? d >> shift : -(-d >> shift)));
+    const int32_t d = (int32_t)(v << 8) - *q, s = d >> 31;
+    *q = (uint16_t)(*q + ((((d ^ s) - s) >> shift ^ s) - s));
 }
 
 /* ---- capture ---------------------------------------------------------------- */
@@ -395,7 +408,7 @@ static void emit(const fam_t *f, unsigned pulse, unsigned gap)
     }
     const uint8_t n = r->bits[g.nrows];
     if (n < ROW_BYTES * 8u) {
-        if (v > f->thr)
+        if ((v > f->thr) ^ (f->kind >> 1))
             r->bytes[g.nrows][n >> 3] |= (uint8_t)(0x80u >> (n & 7u));
         r->bits[g.nrows] = (uint8_t)(n + 1u);
     }
@@ -443,22 +456,28 @@ static void demod(const fam_t *f, unsigned n, unsigned off)
 
 /* ---- protocol matching ------------------------------------------------------ */
 
-/* len (<= 16) bits of the current row from data bit pos (after the skipped bits) */
+/* n = len & 15 bits of the current row, MSB first (n 0: 0): bit i of the
+ * field is row bit pos + (i ^ x), x = len >> 4.  x 0 reads the bits as sent;
+ * gen_assets.py sets x and moves pos back for the fields sent in another
+ * order: LSB first (AlectoV1, TFA: x = 3, 7 or 15 on a window of 4, 8 or 16
+ * bits ending at the field's end), the nibbles of the humidity swapped
+ * (Esperanza: x 4) or of the temperature last to first (x 12 on 16 bits, the
+ * first 4 of them before the field) */
 static unsigned bits(unsigned pos, unsigned len)
 {
     unsigned v = 0;
-    pos += g.skip;
-    while (len--) {
-        v = (v << 1) | ((g.row[pos >> 3] >> (7u - (pos & 7u))) & 1u);
-        pos++;
+    for (unsigned i = 0; i < (len & 15u); i++) {
+        const unsigned q = pos + (i ^ (len >> 4));
+        v = (v << 1) | ((g.row[q >> 3] >> (7u - (q & 7u))) & 1u);
     }
     return v;
 }
 
-/* noinline here and on put(), decode(), grab(), put_t10(), rput() and draw():
- * GCC 13.3 -Os makes the whole smaller with them out of line, and keys() and
- * temperature() inline (each measured on the build; GCC's choices shift
- * with every change, so measure again after a bigger one) */
+/* noinline here and on put(), tiny(), grab(), put_t10(), rput() and draw():
+ * GCC 13.3 -Os (with the flags of build.sh) makes the whole smaller with them
+ * out of line, and keys(), temperature() and decode() inline (each measured
+ * on the build; GCC's choices shift with every change, so measure again
+ * after a bigger one) */
 __attribute__((noinline))
 static bool check(const proto_t *p)
 {
@@ -474,32 +493,41 @@ static bool check(const proto_t *p)
      *     128 ...): the bit weights of the nibble (byte) sum, the last unit
      *     zero padded.
      * cfl bit 0: the key starts over every 8 bits (a CRC of the XOR of the
-     * bytes); nibble csub is read from bits 36-39 (inFactory; 0xFF: none) */
+     * bytes); bit 3: the key is ca << 8, 16 bits (GT-WT-03: 0x3100 shifted
+     * right, cc 0, its low byte the weight); bits 6-7: XORed into the bit
+     * index, 3 for nibbles sent LSB first (the weights 8 4 2 1 go to their
+     * bits 3 to 0).  Nibble csub is read from bits 36-39 (inFactory; 0xFF:
+     * none); cw: as a field length (bits()), its x in the high nibble.
+     * The checked bits count from the first data bit (after the skipped
+     * ones), cpos from the row start. */
     if (p->check == C_NONE)
         return true;                    /* the repeats decide */
     uint16_t x = p->cb;
-    uint8_t key = p->ca;
+    const unsigned k0 = (unsigned)p->ca << (p->cfl & 8u);
+    unsigned key = k0;
     for (unsigned pos = 0; pos < p->c1; pos++) {
         unsigned q = pos;
         if ((pos >> 2) == p->csub)
             q = 36u + (pos & 3u);
-        if (bits(q, 1))
+        q ^= (unsigned)p->cfl >> 6;
+        if (bits(q + p->skip, 1))
             x = (uint16_t)(p->check == C_SUM ? x + key : x ^ key);
-        key = (uint8_t)(key & 1u ? (key >> 1) ^ p->cc : key >> 1);
+        key = key & 1u ? (key >> 1) ^ p->cc : key >> 1;
         if ((p->cfl & 1u) && (pos & 7u) == 7u)
-            key = p->ca;
+            key = k0;
     }
     if (p->check == C_SUM && !x)        /* all zero: a frame of another timing read */
         return false;                   /* in this one (rtl_433 drops it too) */
-    return (x & ((1u << p->cw) - 1u)) == bits(p->cpos, p->cw);
+    return (x & ((1u << (p->cw & 15u)) - 1u)) == bits(p->cpos, p->cw);
 }
 
-/* 0.1 C from 12 bits: two's complement, or t_off x 10 below 0 C (0.1 C) or
- * below 32 F (0.1 F) */
-static int16_t temperature(const proto_t *p)
+/* 0.1 C from the 12 bits t (T_DEC: three decimal digits): two's complement,
+ * or t_off x 10 below 0 C (0.1 C) or below 32 F (0.1 F) */
+static int16_t temperature(const proto_t *p, unsigned t)
 {
     const uint8_t fl = p->t_fl;
-    uint16_t t = bits(p->t_pos, 12);
+    if (fl & T_DEC)
+        t = ((t >> 8) * 10u + ((t >> 4) & 15u)) * 10u + (t & 15u);
     if (fl & T_SIGNED)
         return (int16_t)((int16_t)(t << 4) >> 4);
     t = (uint16_t)(t - p->t_off * 10u);
@@ -508,15 +536,14 @@ static int16_t temperature(const proto_t *p)
     return (int16_t)t;
 }
 
-/* h_len bits (0: none), in % (over 100: no humidity, or a bad BCD digit) */
-static uint8_t humidity(const proto_t *p)
+/* the humidity field h (0: none) less h_off in % (over 100: no humidity, a
+ * bad BCD digit, or a field below h_off) */
+static uint8_t humidity(const proto_t *p, unsigned h)
 {
-    if (!p->h_len)
-        return 0;
-    uint8_t h = (uint8_t)bits(p->h_pos, p->h_len);
+    h = (uint8_t)(h - p->h_off);
     if (p->flags & F_HBCD)
-        h = (h & 15u) > 9u ? 0xFFu : (uint8_t)((h >> 4) * 10u + (h & 15u));
-    return h;
+        h = (h & 15u) > 9u ? 0xFFu : (h >> 4) * 10u + (h & 15u);
+    return (uint8_t)h;
 }
 
 /* identical rows to row r (itself included) */
@@ -539,6 +566,7 @@ static uint8_t same(uint8_t r)
 static bool match(uint8_t f)
 {
     proto_t p;
+    unsigned v[N_FLD];
     for (unsigned i = 0; i < PROTO_COUNT; i++) {
         asset((uint16_t)(PROTOS + i * PROTO_SIZE), &p, PROTO_SIZE);
         if (p.fam != f)
@@ -548,33 +576,30 @@ static bool match(uint8_t f)
             if (n < p.bmin || n > p.bmax)
                 continue;
             g.row = g.rows->bytes[r];
-            g.skip = 0;                 /* the fixed bits count from the row start */
-            if (p.fix_len && bits(p.fix_pos, p.fix_len) != (uint16_t)(p.fix_hi << 8 | p.fix_lo))
-                continue;
-            g.skip = p.skip;
-            if (!check(&p) || same(r) < p.reps)
+            for (unsigned k = 0; k < N_FLD; k++)
+                v[k] = bits(p.fld[k][0], p.fld[k][1]);
+            if ((v[V_FIX] != p.fix_v) ^ !!(p.flags & F_FIXNE) || !check(&p) || same(r) < p.reps)
                 continue;
             /* the sanity checks of the rtl_433 decoders: a frame shifted by
              * a noise bit can pass a 4-bit check, and repeats as often */
-            const int16_t t = temperature(&p);
-            const uint8_t h = humidity(&p);
-            const uint8_t ch = (uint8_t)(p.ch_len ? bits(p.ch_pos, p.ch_len) : 0u);
+            const int16_t t = temperature(&p, v[V_T]);
+            const uint8_t h = humidity(&p, v[V_H]);
+            const uint8_t ch = (uint8_t)v[V_CH];
             if (t < -400 || t > 700 || ((p.flags & F_HREJ) && h > 100u) || ((p.flags & F_CHNZ) && !ch))
                 continue;
             sensor_t *const rd = g.rd;
             rd->proto = (uint8_t)i;
-            rd->id = (uint8_t)bits(p.id_pos, p.id_len);
+            rd->id = (uint8_t)v[V_ID];
             rd->ch = (uint8_t)(ch + (p.flags & F_CH1));
             rd->t10 = t;
             rd->hum = h && h <= 100u ? h : NO_HUM;
-            rd->low = (uint8_t)(bits(p.bat, 1) ^ ((p.flags & F_BATOK) ? 1u : 0u));
+            rd->low = (uint8_t)(v[V_BAT] ^ ((p.flags & F_BATOK) ? 1u : 0u));
             return true;
         }
     }
     return false;
 }
 
-__attribute__((noinline))
 static uint8_t decode(uint16_t n)
 {
     fam_t f;
@@ -810,13 +835,13 @@ static void draw(void)
         tail += 4u;
     asset((uint16_t)(BMP_TAIL + tail * TAIL_W), a->status_line + 64, TAIL_W);
     if (g.vhf) {
-        a->print_tiny(s + T_VHF1, 0, 17, false, true);
-        a->print_tiny(s + T_VHF2, 0, 25, false, true);
+        tiny(s + T_VHF1, 17);
+        tiny(s + T_VHF2, 25);
         return;
     }
 
     if (!g.n && !g.is_auto)            /* VFO, nothing heard yet: how to search */
-        a->print_tiny(s + T_HINT, 0, 17, false, true);
+        tiny(s + T_HINT, 17);
     const uint32_t now = a->ticks_ms();
     const sensor_t *e = g.tab + g.top;
     for (uint8_t r = 0; r < ROWS_SHOWN && (uint8_t)(g.top + r) < g.n; r++, e++) {
@@ -834,7 +859,7 @@ static void draw(void)
         if (e->low)
             b[31] = '!';
         b[32] = 0;
-        a->print_tiny(b, 0, (uint8_t)(r * 8u + 1u), false, true);
+        tiny(b, (uint8_t)(r * 8u + 1u));
         if ((uint8_t)(g.top + r) == g.sel)
             for (unsigned x = 0; x < 128u; x++)
                 a->fb[r][x] ^= 0xFFu;
@@ -878,7 +903,8 @@ static void draw(void)
     a->print_inverse(v, (uint8_t)(127u - 4u * (unsigned)(ve - v)), 6, false, true, 127);
     for (unsigned x = 0; x < 128u; x += 2u)
         a->fb[6][x] |= 0x01u;
-    tiny(b, o, 50);
+    *o = 0;
+    tiny(b, 50);
 }
 
 /* ---- keys ------------------------------------------------------------------- */
@@ -956,9 +982,9 @@ void app_main(const app_api_t *api)
     g.vfo = api->rx_freq();
     g.vhf = g.vfo < VHF_MAX;
     g.is_auto = g.vfo >= F_FIRST && g.vfo <= F_FIRST + (N_PTS - 1u) * F_STEP;
-    g.reg2b = api->bk_read(REG_2B);    /* the loader's retune leaves it in AM */
+    const uint16_t reg2b = api->bk_read(REG_2B);   /* the loader's retune leaves it in AM */
     api->bk_write(REG_RX_BW, WIDE_BW);
-    api->bk_write(REG_2B, (uint16_t)((g.reg2b | 0x0700u) & ~0x0007u));   /* RX filters off */
+    api->bk_write(REG_2B, (uint16_t)((reg2b | 0x0700u) & ~0x0007u));   /* RX filters off */
     api->bk_write(REG_73, (uint16_t)(api->bk_read(REG_73) | 0x0010u));   /* AFC off */
     api->set_agc(false);               /* fixed gain: steady RSSI and pulse levels */
     g.ctrl = (uint16_t)(api->bk_read(REG_CTRL) | CTRL_AF_DAC);
@@ -995,6 +1021,6 @@ void app_main(const app_api_t *api)
     api->set_af(APP_AF_MUTE);
     api->audio_path(false);
     api->set_agc(true);                /* its retune keeps a cached AGC state */
-    api->bk_write(REG_2B, g.reg2b);
+    api->bk_write(REG_2B, reg2b);
     api->led(false);
 }
