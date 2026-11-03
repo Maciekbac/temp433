@@ -152,8 +152,11 @@ typedef struct {                       /* a reading, and a row of the sensor tab
 } sensor_t;
 
 /* ---- screen ---- */
-#define N_SENS      12u                /* sensors kept; a new one replaces the one  */
-                                       /* heard longest ago                         */
+#define N_SENS      48u                /* sensors kept; a new one replaces the one  */
+                                       /* heard longest ago.  On app_main's stack:  */
+                                       /* 24 B each; with 48 about 1.2 KB of stack  */
+                                       /* stays free (emulator, Labs v6.3.0; 2.1 KB */
+                                       /* with 12)                                  */
 #define ROWS_SHOWN  6u                 /* table rows, frame buffer lines 0-5        */
 #define SLOT        73u                /* trend: 10 min in 8.192 s ticks            */
 
@@ -968,6 +971,7 @@ void app_main(const app_api_t *api)
     rows_t rows;
     uint16_t floorq[N_PTS];
     sensor_t tab[N_SENS + 1u];         /* the sensors, then the reading in decoding */
+                                       /* (49 x 24 B, the biggest block here)       */
 
     A = api;
     g.runs = runs;

@@ -12,7 +12,7 @@ A receive-only overlay app for the
 
 - Reads 19 kinds of 433 MHz thermometers and thermo-hygrometers (see
   [Supported sensors](#supported-sensors)).
-- A table of up to 12 sensors: model, channel, ID, temperature, humidity, the
+- A table of up to 48 sensors: model, channel, ID, temperature, humidity, the
   time since the last reading, and a low battery mark.
 - Searches the whole 433.80-434.04 MHz band (AUTO), or listens on the VFO
   frequency only.
@@ -149,17 +149,19 @@ compared side by side, except for TFA-TWIN (see below).
 
 - A humidity outside 1-100 % shows as `--` (rtl_433 drops such a frame).
 - Temperatures outside -40 to 70 °C are dropped as misreadings.
-- GT-WT-02 humidity codes 10 and 110, which rtl_433 shows as 0 % and 100 %,
-  show as `10%` and `--`.
+- GT-WT-02 and GT-WT-03 humidity codes 10 and 110, which rtl_433 shows as 0 %
+  and 100 %, show as `10%` and `--`.
 - Nexus, Prologue and Auriol AFW 2 A1 send no checksum: a reading counts once
   the same frame comes twice.
+- TFA-TWIN and ALECTOV1 have a 4-bit checksum only: rarely, a Prologue frame
+  shows up as one of them, with wrong values.
 - TFA-TWIN shows the whole first byte as its ID, channel bits included; rtl_433
   leaves those out, so its ID is another number for the same sensor.
 - LACROSSE shows the temperature only (the humidity comes in separate frames)
   and channel 0 (these sensors have none).
 - ESPERANZA also reads Kedsum and Conrad S3318P sensors (the same frame); the
   battery state of a Kedsum may be shown wrongly.
-- The table keeps 12 sensors; a new one then replaces the one heard longest
+- The table keeps 48 sensors; a new one then replaces the one heard longest
   ago. The table is not kept after the app exits.
 
 ## How it works

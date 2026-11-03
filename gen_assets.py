@@ -86,6 +86,9 @@ TREND = [[0x20, 0x30, 0x38, 0x30, 0x20],    # up
 #     (off).  One family per timing, the thresholds halfway (a shared one left
 #     too little margin, e.g. the HG02832 long pulse of 612 us against the
 #     Bresser sync pulse of 750 us).
+#   PWM_SHORT1 (kind 3: a short pulse is 1, as rtl_433 reads La Crosse TX):
+#     PWM with the bit inverted (emit() XORs it with kind >> 1); no sync
+#     pulse (brk 255), a gap longer than end ends the row.
 PPM, PWM, PWM_SHORT1 = 0, 1, 3
 FAMILIES = [
     ("PPM 1000/2000", PPM, s(1500), s(3000), 255, 3, s(500), s(800)),   # Rubicson, Nexus: sync 4000
@@ -185,7 +188,10 @@ proto("AUR-AHFL", 1, (42, 42), 0, F_CH1 | F_BATOK, 1, NIBBLE_SUM, (36, 36, 6),
 # INFACTORY: a frame of either rarely passes the other's CRC.
 proto("ESPERANZA", 1, (42, 42), 2, F_CH1 | F_HSWAP | F_HREJ, 2, crc_digest(0x3, 4, 32), (36, 36, 4),
       (0, 2, 0), (0, 8), (10, 2), 33, (12, T_LE | T_F, 122), (24, 8))   # + Kedsum, Conrad S3318P
-proto("INFACTORY", 1, (40, 42), 0, F_HBCD | F_HREJ | F_CHNZ, 2, crc_digest(0x3, 4, 32, sub=2), (36, 8, 4),
+# inFactory: exactly 40 bits, as rtl_433 takes them.  A noise pulse late in
+# the 8 ms gap before the data adds a bit in front (41 bits, every field
+# shifted), and the 42-bit frames of Vauno would read as other values here.
+proto("INFACTORY", 1, (40, 40), 0, F_HBCD | F_HREJ | F_CHNZ, 2, crc_digest(0x3, 4, 32, sub=2), (36, 8, 4),
       None, (0, 8), (38, 2), 13, (16,) + F900, (28, 8))            # + nor-tec, FreeTec NC-3982;
                                                                    # its CRC-4 0x13 is 0x3 in 4 bits
 proto("VAUNO", 1, (42, 44), 0, F_CH1, 2, NIBBLE_SUM, (36, 36, 6),
@@ -217,10 +223,12 @@ proto("ALECTOV1", 1, (36, 36), 0, F_LSB | F_FIXNE | F_HBCD | F_HREJ, 2, (C_SUM, 
 # out the channel bits in the middle of byte 0: here the whole reversed byte
 # 0 (the same sensors told apart, other numbers).  A negative temperature has
 # its 3 top bits set (9 bits + sign in rtl_433), a 12-bit two's complement.
-# After ALECTOV1, whose checks are stronger; its 4-bit sum lets about 1 of
-# 16 Prologue frames through (the humidity check stops some).
+# Bit 31, after the humidity, is always 1 (rtl_433's layout HHHHHHH1, and
+# both its examples).  After ALECTOV1, whose checks are stronger; its 4-bit
+# sum lets about 1 of 16 Prologue frames through (the humidity check and
+# bit 31 stop some).
 proto("TFA-TWIN", 1, (36, 36), 0, F_LSB | F_HREJ, 2, NIBBLE_SUM, (32, 32, 4),
-      None, (0, 8), (4, 2), 8, (12,) + S12, (24, 7, 28))            # TFA 30.3049, Conrad KW9010, Ea2 BL999
+      (31, 1, 1), (0, 8), (4, 2), 8, (12,) + S12, (24, 7, 28))      # TFA 30.3049, Conrad KW9010, Ea2 BL999
 proto("PROLOGUE", 1, (36, 37), 0, F_CH1 | F_BATOK, 2, NOCHECK, (0, 0, 0),
       (2, 2, 0x1), (4, 8), (14, 2), 12, (16,) + S12, (28, 8))      # type 9/5; + ThermoPro TX2
 # PPM 576/1536
@@ -285,6 +293,10 @@ def pack(entry):
         assert pos >= 0 and pos + (x | (n - 1)) < ROW_BITS, name
         return pos, n | x << 4
     lsb = flags & F_LSB
+    # check() XORs the bit index with 3 for F_LSB: right for the nibble sum
+    # only (the weights 8 4 2 1 to bits 3..0); a byte sum or a CRC sent LSB
+    # first would need another index order
+    assert not lsb or (ck == C_SUM and ca == cc == 8), name
     r["fld"] = [order(pos, n, lsb) for pos, n in fld]
     if tfl & T_LE:
         r["fld"][V_T] = order(fld[V_T][0] - 4, 12, False, 12)
