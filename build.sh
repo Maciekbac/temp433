@@ -9,7 +9,7 @@ cd "$(dirname "$0")"
 
 APP=temp433
 APP_NAME="Temp 433"
-APP_VER="0.2"
+APP_VER="0.3"
 APP_API_MIN=3
 APP_VMA=${APP_VMA:-0x20000280}
 OUT="${APP_NAME// /}"
