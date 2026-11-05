@@ -41,14 +41,17 @@
  *
  * Decoders: one table record per protocol, no code of its own.  One loop
  * runs every check of the table: a sum of 4- or 8-bit units, or a linear
- * digest that covers every CRC and LFSR check (see check()); the temperature
- * and humidity encodings are flags, the order of a field's bits (LSB first,
- * nibbles swapped) part of its record (see bits()).
+ * digest that covers every CRC and LFSR check, each bit with its weight from
+ * the assets (see check()); the temperature and humidity encodings are flags,
+ * the order of a field's bits (LSB first, nibbles swapped) part of its record
+ * (see bits()).
  *
- * Keys: UP/DOWN select a sensor (its frequency, level and temperature trend
- * in the bottom line), 1 speaker, 2 clear the table and the count of unknown
- * packets, 3 sensitivity (High 6 dB, Normal 10 dB, Low 15 dB above the
- * noise), 5 AUTO / VFO, EXIT quit.
+ * While the table has 3 sensors or fewer its free rows 3-5 show the keys.
+ * Keys: UP/DOWN select a sensor (its frequency and level in the bottom line),
+ * MENU its card (big digits, the trend, min/max, reception; MENU or EXIT
+ * back, UP/DOWN the next sensor), 1 speaker, 2 clear the table and the count
+ * of unknown packets, 3 sensitivity (High 6 dB, Normal 10 dB, Low 15 dB above
+ * the noise), 5 AUTO / VFO, EXIT quit.
  */
 
 #include <stdint.h>
@@ -99,20 +102,26 @@
 
 /* ---- decoding ---- */
 #define ROWS        16u
-#define ROW_BYTES   16u                /* 128 bits                                   */
+#define ROW_BYTES   16u                /* 120 bits, then the count of bits           */
+#define ROW_BITS    120u               /* (the longest frame, EMOS, has 120)         */
 #define MIN_ROW     16u                /* bits: a shorter row is noise               */
 enum { C_NONE, C_SUM, C_DIGEST };
 enum { EMPTY, PACKET, DECODED };
 #define F_CH1       1u                 /* flags: the channel is shown +1             */
 #define F_BATOK     2u                 /* the battery bit is 1 when OK (else when low) */
+#define F_NOBAT     4u                 /* no battery state sent (low bit 1: the card) */
 #define F_HBCD      8u                 /* humidity in BCD                            */
 #define F_HREJ      16u                /* a humidity over 100 % rejects the frame    */
 #define F_CHNZ      32u                /* channel 0 rejects the frame                */
 #define F_FIXNE     128u               /* the fixed bits must not hold their value   */
 #define T_SIGNED    1u                 /* t_fl: 12-bit two's complement, 0.1 C       */
 #define T_DEC       4u                 /* three decimal digits                       */
-#define T_F         8u                 /* 0.1 F, t_off x 10 below 32 F               */
+#define T_F         8u                 /* 0.1 F                                      */
 #define NO_HUM      0xFFu
+#define S_CARD      4u                 /* the state bits of draw()'s pieces: the card, */
+#define S_EMPTY     16u                /* no sensor yet, the key help (bit 3 VHF, bit */
+#define S_HELP      64u                /* 5 AUTO; bits 0-1 the card sensor's low)    */
+#define S_EVERY     128u               /* the card: the sensor's period is known     */
 
 typedef struct {                       /* FAMS record of the assets (8 B)            */
     uint8_t kind;                      /* 0 PPM, 1 PWM (a long pulse is 1), 3 PWM    */
@@ -129,34 +138,52 @@ enum { V_FIX, V_ID, V_CH, V_BAT, V_T, V_H, N_FLD };
 
 typedef struct {                       /* PROTOS record of the assets (32 B)         */
     uint8_t fam, bmin, bmax, skip, flags, reps;
-    uint8_t check, c1, cpos, cw, ca, cb, cc, cfl;      /* see check()               */
+    uint8_t check, c1, cpos, cw, cb, spare;            /* see check()               */
+    uint16_t ktab;                     /* asset offset of the c1 weights of check() */
     uint8_t fld[N_FLD][2];             /* (pos, len | x << 4) of each field, from   */
                                        /* the row start (gen_assets.py adds the     */
                                        /* skipped bits to all but the fixed bits;   */
                                        /* cpos too): see bits()                     */
     uint16_t fix_v;                    /* the value the fixed bits must hold         */
-    uint8_t t_fl, t_off, csub, h_off;  /* h_off: subtracted from the humidity field  */
+    uint8_t t_fl, h_off;               /* h_off: subtracted from the humidity field  */
+    uint16_t t_off;                    /* see temperature()                          */
 } proto_t;
-_Static_assert(sizeof(fam_t) == FAM_SIZE && sizeof(proto_t) == PROTO_SIZE, "the records of gen_assets.py");
+typedef struct {                       /* PIECES record of the assets (10 B): draw() */
+    uint8_t fn;                        /* app_api_t service, by its pointer index; 0 ends */
+    uint8_t src, len;                  /* the text: draw()'s buffer (row, then UI texts) */
+    uint8_t x, a1, a2, a3, a4;         /* the arguments after the text               */
+    uint8_t mask, val;                 /* drawn when (low & mask) == val             */
+} piece_t;
+_Static_assert(sizeof(fam_t) == FAM_SIZE && sizeof(proto_t) == PROTO_SIZE && sizeof(piece_t) == PIECE_SIZE,
+               "the records of gen_assets.py");
+_Static_assert(offsetof(app_api_t, print_bold) == 4 * FN_BOLD && offsetof(app_api_t, print_tiny) == 4 * FN_TINY &&
+               offsetof(app_api_t, display_freq) == 4 * FN_BIG && offsetof(app_api_t, print_inverse) == 4 * FN_INV &&
+               offsetof(app_api_t, draw_battery) == 4 * FN_BATT, "the service indexes of gen_assets.py");
 
-typedef struct {
-    uint8_t bytes[ROWS][ROW_BYTES];
-    uint8_t bits[ROWS];
+typedef struct {                       /* a row's count of bits in its last byte:   */
+    uint8_t bytes[ROWS][ROW_BYTES];    /* same() compares it with the bits          */
 } rows_t;
+#define RBITS(rs, k) ((rs)->bytes[k][ROW_BYTES - 1u])
 
 typedef struct {                       /* a reading, and a row of the sensor table  */
-    uint8_t proto, id, ch, low, hum, rssi;                  /* rssi: dBm + 160       */
+    uint32_t seen;                     /* ticks_ms of the last one (first: 4 B less */
+                                       /* code than after the bytes)                */
+    uint8_t proto, id, ch, low, hum;   /* low: bit 0 battery low, bit 1 none sent   */
+    uint8_t rssi;                      /* dBm + 160                                 */
+    uint8_t rx, every, pt;             /* readings (up to 255), the shortest gap of */
+                                       /* 5 s or more in 1.024 s (0xFF: none yet),  */
+                                       /* the point (NO_PT: the VFO)                */
     int16_t t10;                       /* 0.1 C                                     */
-    uint32_t seen, f;                  /* ticks_ms of the last one, its frequency   */
+    int16_t tmin, tmax;                /* since the first reading                   */
     uint32_t ref, next;                /* trend (store()): t10 << 16 | ticks_ms >> 13 */
 } sensor_t;
 
 /* ---- screen ---- */
-#define N_SENS      48u                /* sensors kept; a new one replaces the one  */
+#define N_SENS      64u                /* sensors kept; a new one replaces the one  */
                                        /* heard longest ago.  On app_main's stack:  */
-                                       /* 24 B each; with 48 about 1.2 KB of stack  */
-                                       /* stays free (emulator, Labs v6.3.0; 2.1 KB */
-                                       /* with 12)                                  */
+                                       /* 28 B each; with 64 about 500 B of stack   */
+                                       /* stays free (emulator, Labs v6.3.0; the    */
+                                       /* user's choice: more sensors, less spare)  */
 #define ROWS_SHOWN  6u                 /* table rows, frame buffer lines 0-5        */
 #define SLOT        73u                /* trend: 10 min in 8.192 s ticks            */
 
@@ -164,7 +191,7 @@ typedef struct {                       /* a reading, and a row of the sensor tab
  * fields first so their offsets fit ldrb's immediate.  The loader zeroes the
  * overlay at every launch. */
 static struct {
-    uint8_t running, prev, saver, sens, spk, vhf, is_auto, pt, nrows, off, hold_pt, aborted, pkt;
+    uint8_t running, prev, saver, sens, spk, vhf, is_auto, pt, nrows, off, hold_pt, aborted, pkt, card;
     uint8_t n, sel, top;               /* table: sensors, selected, first shown     */
     uint16_t ctrl, unk;                /* unk: packets no protocol took             */
     uint32_t vfo, f0, armed, hold_until, led_until, next_draw;  /* led_until 0: LED off */
@@ -187,28 +214,47 @@ void *memset(void *dst, int value, size_t size)
     return dst;
 }
 
+/* Three API services called from everywhere, each through a local stub that
+ * keeps every call a plain bl.  The stub jumps to the service with the
+ * caller's arguments and return address: GCC makes no tail calls on Thumb-1,
+ * and push / blx / pop would cost 4 B more in each.  Plain asm (all a naked
+ * function may hold), so the offsets are numbers, checked here: g.api, and
+ * the services in app_api_t (from 252 on: an ldr offset reaches 124). */
+#define G_API        56
+#define API_ASSET    264
+#define API_UIDIVMOD 272
+#define API_APPENDU  352
+#define STR_(x)      #x
+#define STR(x)       STR_(x)
+#define JUMP(off)    __asm__ ("ldr r3, =g\n\tldr r3, [r3, #" STR(G_API) "]\n\tadd r3, #252\n\t" \
+                              "ldr r3, [r3, #" STR(off) " - 252]\n\tbx r3\n\t.ltorg")
+_Static_assert(offsetof(__typeof__(g), api) == G_API && offsetof(app_api_t, asset_read) == API_ASSET &&
+               offsetof(app_api_t, uidivmod) == API_UIDIVMOD && offsetof(app_api_t, append_u32) == API_APPENDU,
+               "the offsets of JUMP()");
+
 /* The resident division helper instead of libgcc's: quotient in r0,
  * remainder in r1, as the AEABI helper returns them. */
-__attribute__((noinline))
-uint64_t __aeabi_uidivmod(uint32_t n, uint32_t d)
+__attribute__((naked, noinline))
+uint64_t __aeabi_uidivmod(uint32_t n __attribute__((unused)), uint32_t d __attribute__((unused)))
 {
-    return A->uidivmod(n, d);
+    JUMP(API_UIDIVMOD);
 }
 uint64_t __aeabi_uidiv(uint32_t n, uint32_t d) __attribute__((alias("__aeabi_uidivmod")));
 
-__attribute__((noinline))
-static void asset(uint16_t offset, void *buf, uint16_t len)
+__attribute__((naked, noinline))
+static void asset(uint16_t offset __attribute__((unused)), void *buf __attribute__((unused)),
+                  uint16_t len __attribute__((unused)))
 {
-    A->asset_read(offset, buf, len);
+    JUMP(API_ASSET);
 }
 
 /* ---- text ------------------------------------------------------------------ */
 
-/* The resident formatter: one local stub keeps every call a plain bl. */
-__attribute__((noinline))
-static char *putu(char *o, uint32_t v)
+/* The resident formatter (API 3) */
+__attribute__((naked, noinline))
+static char *putu(char *o __attribute__((unused)), uint32_t v __attribute__((unused)))
 {
-    return A->append_u32(o, v);
+    JUMP(API_APPENDU);
 }
 
 __attribute__((noinline))
@@ -219,26 +265,30 @@ static char *put(char *o, const char *s)
     return o;
 }
 
-/* v / scale as "int.frac", scale a power of ten (one digit per zero) */
-static char *put_fixed(char *o, uint32_t v, uint32_t scale)
+/* v / scale as "-int.frac", scale a power of ten (one digit per zero): the
+ * fraction as the remainder plus the scale, its leading 1 then the point */
+static char *put_fixed(char *o, int32_t v, uint32_t scale)
 {
-    uint64_t qr = __aeabi_uidivmod(v, scale);
-    o = putu(o, (uint32_t)qr);
-    *o++ = '.';
-    uint32_t r = (uint32_t)(qr >> 32);
-    while (scale > 1u) {
-        scale = (uint32_t)__aeabi_uidivmod(scale, 10u);
-        qr = __aeabi_uidivmod(r, scale);
-        *o++ = (char)('0' + (uint32_t)qr);
-        r = (uint32_t)(qr >> 32);
+    if (v < 0) {
+        *o++ = '-';
+        v = -v;
     }
+    const uint64_t qr = __aeabi_uidivmod((uint32_t)v, scale);
+    o = putu(o, (uint32_t)qr);
+    char *const d = o;
+    o = putu(o, (uint32_t)(qr >> 32) + scale);
+    *d = '.';
     return o;
 }
 
-/* 10 Hz units -> "434.2125", "433.920" (at least the kHz) */
+/* 0.1 C as "-12.3" */
+#define put_t10(o, t) put_fixed(o, t, 10u)
+
+/* 10 Hz units -> "434.2125", "433.920" (at least the kHz): five decimals,
+ * the last (10 Hz) left out */
 static char *put_freq(char *o, uint32_t f)
 {
-    o = put_fixed(o, (uint32_t)__aeabi_uidivmod(f, 10u), 10000u);
+    o = put_fixed(o, (int32_t)f, 100000u) - 1;
     return o[-1] == '0' ? o - 1 : o;
 }
 
@@ -275,9 +325,10 @@ static void go(uint8_t p)
     A->delay_ms(SETTLE_MS - 1u);
 }
 
-/* dBm + 160 at the current frequency (REG_67 holds (dBm + 160) x 2) */
-static uint8_t measure(void)
+/* dBm + 160 at point p (REG_67 holds (dBm + 160) x 2) */
+static uint8_t measure(uint8_t p)
 {
+    go(p);
     A->delay_ms(1);
     A->bk_read(REG_RSSI);               /* the first read may still move */
     return (uint8_t)((A->bk_read(REG_RSSI) & 0x1FFu) >> 1);
@@ -314,7 +365,8 @@ static uint16_t capture(void)
     uint32_t next = clk();
     /* unsigned, not the uint16_t they fit in (18000 samples at most): no
      * zero extension after every step */
-    unsigned lo = 4095u, hi = 0, len = 0, quiet = 0, edges = 0, n = 0, kp = 0, k;
+    unsigned lo = ~0u, hi = 0, len = 0, quiet = 0, edges = 0, n = 0, kp = 0, k;   /* lo: the first */
+                                       /* sample (12 bits) sets it                  */
     unsigned x1 = sample(), x2 = x1, x3 = x1;   /* the mean starts from the first sample */
     unsigned level = 2, cand = 0;      /* level 2: not known yet */
     g.aborted = 0;
@@ -390,7 +442,7 @@ static uint16_t capture(void)
 static void row_end(void)
 {
     rows_t *const r = g.rows;
-    const uint8_t b = r->bits[g.nrows];
+    const uint8_t b = RBITS(r, g.nrows);
     if (b >= MIN_ROW)
         g.pkt = PACKET;
     if (b && g.nrows < ROWS - 1u)
@@ -400,7 +452,8 @@ static void row_end(void)
 /* one bit: PPM from the gap after the pulse, PWM from the pulse.  A bit run
  * longer than brk (PPM: a gap, PWM: a sync pulse) ends the row instead; in
  * PWM a gap longer than end ends it after the bit (PPM: end 255, past every
- * gap that gets here) */
+ * gap that gets here).  A row keeps ROW_BITS bits; a longer one counts to
+ * ROW_BITS + 1, longer than every protocol */
 static void emit(const fam_t *f, unsigned pulse, unsigned gap)
 {
     rows_t *const r = g.rows;
@@ -409,11 +462,11 @@ static void emit(const fam_t *f, unsigned pulse, unsigned gap)
         row_end();
         return;
     }
-    const uint8_t n = r->bits[g.nrows];
-    if (n < ROW_BYTES * 8u) {
-        if ((v > f->thr) ^ (f->kind >> 1))
+    const uint8_t n = RBITS(r, g.nrows);
+    if (n <= ROW_BITS) {
+        if (n < ROW_BITS && ((v > f->thr) ^ (f->kind >> 1)))
             r->bytes[g.nrows][n >> 3] |= (uint8_t)(0x80u >> (n & 7u));
-        r->bits[g.nrows] = (uint8_t)(n + 1u);
+        RBITS(r, g.nrows) = (uint8_t)(n + 1u);
     }
     if (gap > f->end)
         row_end();
@@ -476,66 +529,52 @@ static unsigned bits(unsigned pos, unsigned len)
     return v;
 }
 
-/* noinline here and on put(), tiny(), grab(), put_t10(), rput() and draw():
- * GCC 13.3 -Os (with the flags of build.sh) makes the whole smaller with them
- * out of line, and keys(), temperature() and decode() inline (each measured
- * on the build; GCC's choices shift with every change, so measure again
- * after a bigger one) */
+/* noinline here and on put(), tiny(), grab(), rput() and draw(): GCC 13.3
+ * -Os (with the flags of build.sh) makes the whole smaller with them out of
+ * line, and keys(), temperature() and decode() inline (each measured on the
+ * build; GCC's choices shift with every change, so measure again after a
+ * bigger one) */
 __attribute__((noinline))
 static bool check(const proto_t *p)
 {
-    /* One loop for both checks: x from cb, then for every 1 of the first c1
-     * bits x += key (C_SUM) or x ^= key (C_DIGEST), the key one LFSR step
-     * back after each bit: key & 1 ? (key >> 1) ^ cc : key >> 1.
+    /* One loop for both checks: x from cb, then for every 1 among the first
+     * c1 data bits (after the skipped ones) x += its weight (C_SUM) or
+     * x ^= its weight (C_DIGEST), the c1 weights read from ktab.  The low
+     * cw bits of x must equal the check field (cpos from the row start, cw
+     * as a field length: bits()).  gen_assets.py computes the weights:
      *   C_DIGEST: a CRC with no final XOR is linear: the CRC of a message is
-     *     the one of its init XOR, for every 1 bit, the CRC that bit alone
-     *     leaves, and those follow each other like that LFSR (cc: the
-     *     polynomial shifted for it).  gen_assets.py derives cb, ca and cc
-     *     from the CRC (or LFSR digest) as its source defines it.
-     *   C_SUM: ca = cc = 8 (128) steps the key 8 4 2 1 8 ... (128 64 .. 1
-     *     128 ...): the bit weights of the nibble (byte) sum, the last unit
-     *     zero padded.
-     * cfl bit 0: the key starts over every 8 bits (a CRC of the XOR of the
-     * bytes); bit 3: the key is ca << 8, 16 bits (GT-WT-03: 0x3100 shifted
-     * right, cc 0, its low byte the weight); bits 6-7: XORed into the bit
-     * index, 3 for nibbles sent LSB first (the weights 8 4 2 1 go to their
-     * bits 3 to 0).  Nibble csub is read from bits 36-39 (inFactory; 0xFF:
-     * none); cw: as a field length (bits()), its x in the high nibble.
-     * The checked bits count from the first data bit (after the skipped
-     * ones), cpos from the row start. */
-    if (p->check == C_NONE)
-        return true;                    /* the repeats decide */
+     *     the one of its init (cb) XOR, for every 1 bit, the CRC that bit
+     *     alone leaves (its weight), from the CRC or LFSR digest as its
+     *     source defines it; also the XOR of the bytes before a CRC
+     *     (HG02832) and GT-WT-03's rolling byte.
+     *   C_SUM: each bit's weight in its nibble (byte) of the sum, 8 4 2 1
+     *     (128 .. 1), the last unit zero padded.
+     * The bit order (nibbles sent LSB first) and inFactory's channel nibble
+     * in place of its check nibble are only other weights; C_NONE checks no
+     * bits (c1 0, cw 0: the repeats decide). */
+    uint8_t key[KEY_MAX];
+    asset(p->ktab, key, p->c1);
     uint16_t x = p->cb;
-    const unsigned k0 = (unsigned)p->ca << (p->cfl & 8u);
-    unsigned key = k0;
-    for (unsigned pos = 0; pos < p->c1; pos++) {
-        unsigned q = pos;
-        if ((pos >> 2) == p->csub)
-            q = 36u + (pos & 3u);
-        q ^= (unsigned)p->cfl >> 6;
-        if (bits(q + p->skip, 1))
-            x = (uint16_t)(p->check == C_SUM ? x + key : x ^ key);
-        key = key & 1u ? (key >> 1) ^ p->cc : key >> 1;
-        if ((p->cfl & 1u) && (pos & 7u) == 7u)
-            key = k0;
-    }
+    for (unsigned pos = 0; pos < p->c1; pos++)
+        if (bits(pos + p->skip, 1))
+            x = (uint16_t)(p->check == C_SUM ? x + key[pos] : x ^ key[pos]);
     if (p->check == C_SUM && !x)        /* all zero: a frame of another timing read */
         return false;                   /* in this one (rtl_433 drops it too) */
     return (x & ((1u << (p->cw & 15u)) - 1u)) == bits(p->cpos, p->cw);
 }
 
-/* 0.1 C from the 12 bits t (T_DEC: three decimal digits): two's complement,
- * or t_off x 10 below 0 C (0.1 C) or below 32 F (0.1 F) */
+/* 0.1 C from the 12 bits t (T_DEC: three decimal digits), less t_off as
+ * gen_assets.py sets it: two's complement with bit 11 flipped, less 2048;
+ * an offset x 10 below 0 C (0.1 C) or below 32 F (0.1 F; 720 less: the
+ * -40 F of the conversion, from which it is rounded) */
 static int16_t temperature(const proto_t *p, unsigned t)
 {
     const uint8_t fl = p->t_fl;
-    if (fl & T_DEC)
-        t = ((t >> 8) * 10u + ((t >> 4) & 15u)) * 10u + (t & 15u);
-    if (fl & T_SIGNED)
-        return (int16_t)((int16_t)(t << 4) >> 4);
-    t = (uint16_t)(t - p->t_off * 10u);
-    if (fl & T_F)                       /* rounded, from -40 F (-720) up */
-        t = (uint16_t)(((uint16_t)(t + 720u) * 5u + 4u) / 9u - 400u);
+    if (fl & T_DEC)                     /* 100 d2 + 10 d1 + d0 */
+        t = t - 6u * (t >> 4) - 60u * (t >> 8);
+    t = (uint16_t)((t ^ ((fl & T_SIGNED) << 11)) - p->t_off);
+    if (fl & T_F)
+        t = (uint16_t)((t * 5u + 4u) / 9u - 400u);
     return (int16_t)t;
 }
 
@@ -549,14 +588,13 @@ static uint8_t humidity(const proto_t *p, unsigned h)
     return (uint8_t)h;
 }
 
-/* identical rows to row r (itself included) */
+/* identical rows to row r (itself included; the count of bits is the last
+ * byte) */
 static uint8_t same(uint8_t r)
 {
     const rows_t *const rs = g.rows;
     uint8_t n = 0;
     for (unsigned k = 0; k < g.nrows; k++) {
-        if (rs->bits[k] != rs->bits[r])
-            continue;
         unsigned i = 0;
         while (i < ROW_BYTES && rs->bytes[k][i] == rs->bytes[r][i])
             i++;
@@ -575,7 +613,7 @@ static bool match(uint8_t f)
         if (p.fam != f)
             continue;
         for (unsigned r = 0; r < g.nrows; r++) {
-            const uint8_t n = g.rows->bits[r];
+            const uint8_t n = RBITS(g.rows, r);
             if (n < p.bmin || n > p.bmax)
                 continue;
             g.row = g.rows->bytes[r];
@@ -596,7 +634,8 @@ static bool match(uint8_t f)
             rd->ch = (uint8_t)(ch + (p.flags & F_CH1));
             rd->t10 = t;
             rd->hum = h && h <= 100u ? h : NO_HUM;
-            rd->low = (uint8_t)(v[V_BAT] ^ ((p.flags & F_BATOK) ? 1u : 0u));
+            /* bit 0 the battery bit, inverted by F_BATOK; bit 1 F_NOBAT */
+            rd->low = (uint8_t)((v[V_BAT] ^ (p.flags >> 1)) & 3u);
             return true;
         }
     }
@@ -627,7 +666,12 @@ static uint8_t decode(uint16_t n)
  * Trend: a reading kept as its temperature and its time in 8.192 s ticks (16
  * bits: 6 days around).  The reference starts as the first reading; once the
  * next one is SLOT old it takes over and this reading becomes the next, so
- * the reference is 10-20 min old (the first reading for the first 10-20 min) */
+ * the reference is 10-20 min old (the first reading for the first 10-20 min).
+ * The card's statistics count from the first reading: readings (they stay
+ * at 255), the shortest gap between two of them, 5 s or more (shorter: the
+ * same transmission caught twice; a lost packet only makes a gap longer, so
+ * the shortest is the sensor's period), and the lowest and highest
+ * temperature */
 static void store(void)
 {
     sensor_t *const t = g.tab, *const r = g.rd;
@@ -640,13 +684,26 @@ static void store(void)
     }
     const uint32_t now = (uint32_t)r->t10 << 16 | (uint16_t)(r->seen >> 13);
     r->ref = r->next = now;
+    r->rx = 1;
+    r->every = 0xFFu;
+    r->tmin = r->tmax = r->t10;
     if (i < g.n) {
-        r->ref = t[i].ref;
-        r->next = t[i].next;
+        const sensor_t *const o = t + i;
+        r->ref = o->ref;
+        r->next = o->next;
         if ((uint16_t)(now - r->next) >= SLOT) {
             r->ref = r->next;
             r->next = now;
         }
+        r->rx = (uint8_t)(o->rx + (o->rx != 0xFFu));
+        const uint32_t gap = (r->seen - o->seen + 512u) >> 10;   /* 1.024 s, rounded */
+        r->every = o->every;
+        if (gap >= 5u && gap < o->every)
+            r->every = (uint8_t)gap;
+        if (o->tmin < r->tmin)
+            r->tmin = o->tmin;
+        if (o->tmax > r->tmax)
+            r->tmax = o->tmax;
     } else if (i == N_SENS) {
         for (i = old; i + 1u < N_SENS; i++)
             t[i] = t[i + 1u];
@@ -671,8 +728,7 @@ static void grab(uint8_t p, uint8_t v)
         for (uint8_t k = (uint8_t)(p - 1u); k != (uint8_t)(p + 3u); k = (uint8_t)(k + 2u)) {
             if (k >= N_PTS)
                 continue;
-            go(k);
-            const uint8_t w = measure();
+            const uint8_t w = measure(k);
             if (w >= lv + 6u) {
                 q = k;
                 lv = w;
@@ -693,7 +749,7 @@ static void grab(uint8_t p, uint8_t v)
     if (res == PACKET)
         g.unk++;
     if (res == DECODED) {
-        g.rd->f = freq(q);
+        g.rd->pt = g.is_auto ? q : NO_PT;
         g.rd->rssi = lv;
         g.rd->seen = now;
         store();
@@ -729,21 +785,18 @@ static void scan(void)
                 hot = 0;
             }
         }
-        go(p);
-        const uint8_t v = measure();
-        uint16_t *const q = &g.floorq[p];
-        if (!*q) {                      /* the first reading as it is */
-            *q = (uint16_t)(v << 8);
-            continue;
-        }
-        if ((uint32_t)(v << 8) >= *q + thr) {
+        const uint8_t v = measure(p);
+        const uint16_t q = g.floorq[p];
+        if (q && (uint32_t)(v << 8) >= q + thr) {
             if (armed && !(hold && (uint8_t)(p - g.hold_pt + 1u) <= 2u)) {
                 grab(p, v);
                 return;
             }
             continue;                   /* a signal: not the noise */
         }
-        learn(p, v, hot ? 6u : 3u);     /* AUTO: ~0.5 s for the frequent point, ~1.6 s for the others */
+        /* the first reading as it is (shift 0); AUTO: ~0.5 s for the
+         * frequent point, ~1.6 s for the others */
+        learn(p, v, q ? (hot ? 6u : 3u) : 0u);
     }
 }
 
@@ -766,17 +819,6 @@ static void retune(void)
 }
 
 /* ---- screen ----------------------------------------------------------------- */
-
-/* 0.1 C as "-12.3" */
-__attribute__((noinline))
-static char *put_t10(char *o, int16_t t)
-{
-    if (t < 0) {
-        *o++ = '-';
-        t = (int16_t)-t;
-    }
-    return put_fixed(o, (uint32_t)t, 10u);
-}
 
 /* e - s right-aligned to end just before dst */
 __attribute__((noinline))
@@ -809,24 +851,29 @@ static char *put_age(char *o, uint32_t ms)
  * the selected one inverted:
  *   INFACTORY 3 205  -7.3C 100%  1m!
  *   model     ch id  temp  hum  age, low battery
- * Line 6: a dotted line, then the selected sensor's frequency, level and
- * trend (the range or the frequency while the table is empty), and the count
- * of unknown packets inverted at the right end:
- *   433.940 -103dBm ^0.3/14m      ?3 */
+ * or the card of the selected sensor (MENU): pieces of the same row in other
+ * fonts and places (the model in bold, the temperature and humidity in the
+ * big digits of the main screen, the battery and the age), and of the card's
+ * values written after the row's 32 columns (its place in the list, the
+ * temperature trend with its arrow, min/max, the period, the readings).  Every fixed text of the screen (the title, AUTO / VFO, the
+ * VHF lines, the VFO hint) and the card are pieces of one list of the assets
+ * (PIECES, gen_assets.py), drawn by one loop, each when the screen's state
+ * bits say so.
+ * Line 6: a dotted line, then the selected sensor's frequency and level (the
+ * range or the frequency while the table is empty), and the count of unknown
+ * packets inverted at the right end:
+ *   433.940 -103dBm               ?3 */
 __attribute__((noinline))
 static void draw(void)
 {
-    /* the UI texts in one asset read, word-aligned (gen_assets.py pads them) */
-    char s[UI_SIZE] __attribute__((aligned(4)));
-    char b[36], v[8];
+    /* the row (and the card's values after it), then the UI texts in one
+     * asset read; a piece names its text as an offset into this block */
+    char buf[ROW_BUF + UI_SIZE] __attribute__((aligned(4)));
+    char *const b = buf, *const s = buf + ROW_BUF, v[8];
     const app_api_t *const a = A;
     asset(0, s, UI_SIZE);
     a->display_clear();
     a->status_clear();
-    a->print_inverse(s + T_TITLE, 2, 0, true, true, (uint8_t)(2u + T_TITLE_CHARS * 4u));
-    a->draw_battery();
-    a->print_tiny(s + (g.is_auto ? T_AUTO : T_VFO), 37, 1, true, true);
-    asset((uint16_t)(BMP_BARS + g.sens * BARS_W), a->status_line + 55, BARS_W);
     if (g.sel < g.top)                 /* the selected row in view */
         g.top = g.sel;
     if (g.sel >= g.top + ROWS_SHOWN)
@@ -836,63 +883,110 @@ static void draw(void)
         tail += 2u;
     if (g.top + ROWS_SHOWN < g.n)
         tail += 4u;
-    asset((uint16_t)(BMP_TAIL + tail * TAIL_W), a->status_line + 64, TAIL_W);
-    if (g.vhf) {
-        tiny(s + T_VHF1, 17);
-        tiny(s + T_VHF2, 25);
+    /* the sensitivity bars, the speaker and the scroll marks: one of the
+     * 3 x 8 status bitmaps of the assets */
+    asset((uint16_t)(BMP_STATUS + (g.sens * 8u + tail) * STATUS_W), a->status_line + 55, STATUS_W);
+    /* the state bits of the pieces (with the sensor's low, bits 0-1, on the
+     * card) */
+    unsigned fl = (unsigned)g.is_auto << 5 | (unsigned)g.vhf << 3 | (g.n ? 0u : S_EMPTY);
+    if (!g.vhf) {                      /* VHF: the two lines of the pieces alone */
+        const uint32_t now = a->ticks_ms();
+        const uint8_t first = g.card ? g.sel : g.top;    /* the card: one row, */
+        const sensor_t *e = g.tab + first;                /* built for its pieces */
+        for (uint8_t r = 0; r < ROWS_SHOWN && (uint8_t)(first + r) < g.n; r++, e++) {
+            memset(b, ' ', ROW_BUF);        /* the name, space padded in the assets */
+            asset((uint16_t)(T_NAME + e->proto * T_NAME_STRIDE), b, T_NAME_STRIDE);
+            b[10] = (char)('0' + e->ch);
+            rput(b + 15, v, putu(v, e->id));
+            rput(b + 21, v, put_t10(v, e->t10));
+            b[21] = 'C';
+            if (e->hum == NO_HUM)           /* right-aligned: the card's % in one place */
+                b[24] = b[25] = '-';
+            else {
+                rput(b + 26, v, putu(v, e->hum));
+                b[26] = '%';
+            }
+            rput(b + 31, v, put_age(v, now - e->seen));
+            if (e->low & 1u)
+                b[31] = '!';
+            b[32] = 0;
+            if (g.card) {
+                fl |= S_CARD | e->low;
+                /* the card's values, left-aligned in their columns (spaces
+                 * after them): its place in the list, readings, the period
+                 * (with its label only once known), min and max */
+                char *o = putu(b + C_POS, g.sel + 1u);
+                *o++ = '/';
+                putu(o, g.n);
+                putu(b + C_RX, e->rx);
+                if (e->every != 0xFFu) {
+                    fl |= S_EVERY;
+                    put_age(b + C_EVERY, (uint32_t)e->every << 10);
+                }
+                put_t10(b + C_MIN, e->tmin);
+                put_t10(b + C_MAX, e->tmax);
+                /* the change of the temperature since the trend reference,
+                 * over how long (none for the first reading alone): one of
+                 * 3 arrows (down, =, up) by its sign, 5 px in the 2 cells
+                 * before it, on line 1 */
+                const unsigned span = (uint16_t)((e->seen >> 13) - e->ref);
+                if (span) {
+                    const int d = e->t10 - (int16_t)(e->ref >> 16);
+                    asset((uint16_t)(BMP_TREND + TREND_W + (unsigned)((d > 0) - (d < 0)) * TREND_W),
+                          a->fb[1] + 1, TREND_W);
+                    o = put_fixed(b + C_TD + 2, d < 0 ? -d : d, 10u);
+                    *o++ = 'C';
+                    *o++ = '/';
+                    put_age(o, span << 13);
+                }
+                break;
+            }
+            tiny(b, (uint8_t)(r * 8u + 1u));
+            if ((uint8_t)(g.top + r) == g.sel)
+                for (unsigned x = 0; x < 128u; x++)
+                    a->fb[r][x] ^= 0xFFu;
+        }
+        /* rows 3-5 free (3 sensors or fewer, not the card): the key help
+         * there, its texts (pieces too) read into the row buffer, which the
+         * rows above are done with */
+        if (!g.card && g.n <= 3u) {
+            fl |= S_HELP;
+            asset(HELP, b, HELP_SIZE);
+        }
+    }
+    /* Each piece, read one at a time (read with the UI texts, the list saved
+     * 8 B of code but took 136 B more stack): an app_api_t service by its
+     * index (print_bold, print_tiny, display_freq, print_inverse,
+     * draw_battery), the text at buf + src, len long, and the arguments after
+     * the text, x first; drawn when the state bits under mask equal val.  The
+     * services take 0 to 6 arguments and are all called with 6: in the AAPCS
+     * the fifth and sixth go on the stack, where a service with fewer never
+     * looks. */
+    piece_t c;
+    for (unsigned at = PIECES; asset((uint16_t)at, &c, PIECE_SIZE), c.fn; at += PIECE_SIZE) {
+        if ((fl & c.mask) != c.val)
+            continue;
+        char *const t = buf + c.src;
+        const char end = t[c.len];
+        t[c.len] = 0;
+        ((void (*)(const char *, unsigned, unsigned, unsigned, unsigned, unsigned))((void *const *)a)[c.fn])
+            (t, c.x, c.a1, c.a2, c.a3, c.a4);
+        t[c.len] = end;
+    }
+    if (g.vhf)
         return;
-    }
 
-    if (!g.n && !g.is_auto)            /* VFO, nothing heard yet: how to search */
-        tiny(s + T_HINT, 17);
-    const uint32_t now = a->ticks_ms();
-    const sensor_t *e = g.tab + g.top;
-    for (uint8_t r = 0; r < ROWS_SHOWN && (uint8_t)(g.top + r) < g.n; r++, e++) {
-        memset(b, ' ', 32);             /* the name, space padded in the assets */
-        asset((uint16_t)(T_NAME + e->proto * T_NAME_STRIDE), b, T_NAME_STRIDE);
-        b[10] = (char)('0' + e->ch);
-        rput(b + 15, v, putu(v, e->id));
-        rput(b + 21, v, put_t10(v, e->t10));
-        b[21] = 'C';
-        if (e->hum == NO_HUM)
-            b[23] = b[24] = '-';
-        else
-            *putu(b + 23, e->hum) = '%';
-        rput(b + 31, v, put_age(v, now - e->seen));
-        if (e->low)
-            b[31] = '!';
-        b[32] = 0;
-        tiny(b, (uint8_t)(r * 8u + 1u));
-        if ((uint8_t)(g.top + r) == g.sel)
-            for (unsigned x = 0; x < 128u; x++)
-                a->fb[r][x] ^= 0xFFu;
-    }
-
-    /* the selected sensor: where, how strong, and the change of its
-     * temperature since the trend reference, over how long; with no sensor
-     * the range ("433.80-434.04", a text of the assets) or the VFO frequency */
+    /* the selected sensor: where (its point of the sweep, NO_PT: the VFO)
+     * and how strong; with no sensor the range ("433.80-434.04", a text of
+     * the assets) or the VFO frequency */
     char *o;
-    e = g.tab + g.sel;
+    const sensor_t *const e = g.tab + g.sel;
     if (g.n || !g.is_auto) {
-        o = put_freq(b, g.n ? e->f : g.f0);
+        o = put_freq(b, g.n ? (e->pt == NO_PT ? g.vfo : F_FIRST + e->pt * F_STEP) : g.f0);
         if (g.n) {
             *o++ = ' ';
             *o++ = '-';
             o = put(putu(o, 160u - e->rssi), s + T_DBM);
-            const unsigned span = (uint16_t)((e->seen >> 13) - e->ref);
-            if (span) {                 /* not the first reading alone */
-                /* the arrow, 5 px wide, in a space and one more cell */
-                const int d = e->t10 - (int16_t)(e->ref >> 16);
-                o[0] = o[1] = ' ';
-                if (d)
-                    asset((uint16_t)(BMP_TREND + (d < 0 ? TREND_W : 0u)),
-                          a->fb[6] + 4u * (unsigned)(o - b) + 1u, TREND_W);
-                else
-                    o[1] = '=';
-                o = put_fixed(o + 2, (uint32_t)(d < 0 ? -d : d), 10u);
-                *o++ = '/';
-                o = put_age(o, span << 13);
-            }
         }
     } else {
         o = put(b, s + T_RANGE);
@@ -928,15 +1022,19 @@ static void keys(void)
     A->backlight_on();
     g.next_draw = 0;
     switch (k) {
-    case APP_KEY_EXIT:
-        g.running = 0;
+    case APP_KEY_EXIT:                 /* the card: back to the table */
+        g.running = g.card;
+        g.card = 0;
+        break;
+    case APP_KEY_MENU:                 /* the selected sensor's card, and back */
+        g.card = !g.card && g.n;
         break;
     case APP_KEY_1:
         g.spk ^= 1u;
         A->audio_path(g.spk);
         break;
     case APP_KEY_2:
-        g.n = g.sel = g.top = 0;       /* the table and the count start over */
+        g.n = g.sel = g.top = g.card = 0;   /* the table and the count start over */
         reset();
         break;
     case APP_KEY_3:
@@ -971,7 +1069,7 @@ void app_main(const app_api_t *api)
     rows_t rows;
     uint16_t floorq[N_PTS];
     sensor_t tab[N_SENS + 1u];         /* the sensors, then the reading in decoding */
-                                       /* (49 x 24 B, the biggest block here)       */
+                                       /* (65 x 28 B, the biggest block here)       */
 
     A = api;
     g.runs = runs;

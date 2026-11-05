@@ -37,9 +37,12 @@ def mid(a_us, b_us):
     """bit threshold between two times: a run longer than it is the long one"""
     return (a_us + b_us) // (2 * US)
 
-# The screen texts, each padded to a multiple of 4 bytes: draw() reads them in
-# one asset_read into a word-aligned stack block.
+# The screen texts, read by draw() in one asset_read after the row.  The code
+# reads T_RANGE and T_DBM as strings (with a NUL); the pieces cut the others
+# by length, so they are packed with no NUL, each where its bytes already are
+# when they are (see the UI block below).
 RANGE = "433.80-434.04"          # AUTO: F_FIRST and N_PTS in temp433_app.c
+UI_CODE = ("T_RANGE", "T_DBM")
 UI = [
     ("T_TITLE",  "TEMP 433"),
     ("T_AUTO",   "AUTO "),
@@ -49,29 +52,132 @@ UI = [
     ("T_VHF1",   "No 433 sensors on VHF"),
     ("T_VHF2",   "Tune the VFO to 433.920"),
     ("T_HINT",   "5: search " + RANGE + " (AUTO)"),       # VFO, empty table
+    # the card (CARD below)
+    ("T_CH",     "CH"),
+    ("T_ID",     "ID"),
+    ("T_DEG",    "o"),                                    # the 3x5 o, raised: a degree sign
+    ("T_C",      "C"),
+    ("T_MIN",    "MIN"),
+    ("T_MAX",    "MAX"),
+    ("T_EVERY",  "EVERY"),
+    ("T_BOK",    "BATTERY OK"),
+    ("T_BLOW",   "BATTERY LOW"),
+    ("T_RX",     "RX"),
+    ("T_LAST",   "LAST"),
 ]
 NAME_W = 10                      # model names, space padded: table columns 0-9
 
 # Status line icons, vertical bytes, bit 0 at the top.  The speaker and the
 # scroll marks are the bitmaps of the F4HWN apps (FoxHunt, AIS RX; Apache-2.0,
 # see NOTICE), laid out as AIS RX does: 8 variants of an 18-byte tail (bit 0
-# speaker, bit 1 more rows above, bit 2 more rows below), read in one go.
+# speaker, bit 1 more rows above, bit 2 more rows below).  With the 3
+# sensitivity bars in front (and the empty column 63 between) each of the 24
+# combinations is one 27-byte block, read in one go to status line column 55.
 BARS = [[0x40, 0x40, 0, 0x70, 0x70, 0, 0x7C, 0x7C],    # High: 3 bars
         [0x40, 0x40, 0, 0x70, 0x70, 0, 0x40, 0x40],    # Normal: 2
         [0x40, 0x40, 0, 0x40, 0x40, 0, 0x40, 0x40]]    # Low: 1
 SPK = [0x1C, 0x1C, 0x3E, 0x7F, 0x00, 0x22, 0x1C, 0x41, 0x22, 0x1C]
 UP = [0x04, 0x06, 0x07, 0x06, 0x04]
 DN = [0x10, 0x30, 0x70, 0x30, 0x10]
-tails = b""
-for index in range(8):
-    tail = (SPK if index & 1 else [0] * 10) + [0] * 3
-    tail += [(u if index & 2 else 0) | (d if index & 4 else 0) for u, d in zip(UP, DN)]
-    tails += bytes(tail)
+status = b""
+for bars in BARS:                  # sens * 8 + tail
+    for index in range(8):
+        tail = (SPK if index & 1 else [0] * 10) + [0] * 3
+        tail += [(u if index & 2 else 0) | (d if index & 4 else 0) for u, d in zip(UP, DN)]
+        status += bytes(bars + [0] + tail)
+STATUS_W = 27
+assert len(status) == 3 * 8 * STATUS_W
 
-# The trend arrows of the bottom line, rows 3-5 of the frame buffer line it
-# is printed on (the text there: rows 2-6).
-TREND = [[0x20, 0x30, 0x38, 0x30, 0x20],    # up
-         [0x08, 0x18, 0x38, 0x18, 0x08]]    # down
+# The trend marks of the card, rows 2-4 of frame buffer line 1 (its text:
+# rows 1-5), in the order draw() picks them by the sign of the change.
+TREND = [[0x04, 0x0C, 0x1C, 0x0C, 0x04],    # down
+         [0x14, 0x14, 0x14, 0x14, 0x14],    # no change: =
+         [0x10, 0x18, 0x1C, 0x18, 0x10]]    # up
+
+# The fixed texts of the screen and the card of the selected sensor (MENU),
+# drawn by draw() in temp433_app.c: pieces of UI texts or of the table row,
+# each drawn by an app_api_t service (its pointer index) with the arguments
+# after the text, when (state & mask) == val.  The state bits: LOW / NOBAT
+# (the card sensor's low: battery low, no battery state sent), CARD_ON, VHF,
+# EMPTY (no sensor yet), AUTO.  Pieces of the row: ROW(column, length); its
+# columns: 0-8 model, 10 channel, 12-14 ID, 16-20 temperature
+# (right-aligned), 21 C, 23-25 humidity (right-aligned or --), 26 % (a space
+# without humidity), 27-30 age, 32 its NUL; on the card the values draw()
+# writes after it, left-aligned: COL(name) (see COLS).  x in pixels; the 3x5
+# font by y from the frame buffer top (line l at 8 l; status: the status
+# line), the others by line.  The big digits (display_freq) take 13 px a cell
+# and 3 px the point, lines l and l + 1, a leading space an empty cell: the
+# temperature always 55 px.
+FN_BOLD, FN_TINY, FN_INV, FN_BIG, FN_BATT = 6, 7, 16, 17, 30
+# print_bold(s, x, end, line), print_tiny(s, x, y, statusbar, fill), print_inverse(s, x, line,
+# statusbar, fill, end_x), display_freq(s, x, line, center), draw_battery()
+LOW, NOBAT, CARD_ON, VHF, EMPTY, AUTO, HELP = 1, 2, 4, 8, 16, 32, 64    # S_CARD, S_EMPTY, S_HELP in temp433_app.c
+# the card's values (column, width): its place in the list ("3/12"),
+# readings, the period, min, max, the trend (2 cells for its mark, then
+# "0.3C/14m")
+COLS = dict(C_POS=(33, 5), C_RX=(41, 3), C_EVERY=(44, 3),
+            C_MIN=(50, 5), C_MAX=(55, 5), C_TD=(60, 12))
+ROW_BUF = 72                           # draw(): the row and the values, then the UI block
+assert max(c + n for c, n in COLS.values()) <= ROW_BUF and ROW_BUF % 4 == 0
+def ROW(col, n):
+    return (col, n)
+def COL(name):
+    return COLS[name]
+def bold(text, x, line, cond=(CARD_ON, CARD_ON)):
+    return (FN_BOLD, text, x, 0, line, 0, 0, cond)
+def tiny(text, x, y, cond=(CARD_ON, CARD_ON), status=0):
+    return (FN_TINY, text, x, y, status, 1, 0, cond)
+def big(text, x, line):
+    return (FN_BIG, text, x, line, 0, 0, 0, (CARD_ON, CARD_ON))
+PIECES = [
+    # the status line: [TEMP 433] AUTO (bars, speaker, marks: a bitmap) 78% [###]
+    (FN_INV, "T_TITLE", 2, 0, 1, 1, 2 + 4 * 8, (0, 0)),     # the title capsule, 8 characters
+    (FN_BATT, ROW(0, 1), 0, 0, 0, 0, 0, (0, 0)),            # the radio's battery (no text)
+    tiny("T_AUTO", 37, 1, (AUTO, AUTO), 1), tiny("T_VFO", 37, 1, (AUTO, 0), 1),
+    # on VHF only these two lines; in VFO with no sensor yet the hint to search
+    # (1 px from the left edge, as the key help)
+    tiny("T_VHF1", 1, 17, (VHF, VHF)), tiny("T_VHF2", 1, 25, (VHF, VHF)),
+    tiny("T_HINT", 1, 17, (VHF | EMPTY | AUTO, EMPTY)),
+    # the card:
+    #   NEXUS            CH1 ID136 [3/12 ]  (the longest bold name ends at 63)
+    #   v0.3C/14m  MIN -3.1  MAX 9.0         (the mark drawn by draw())
+    #    -12.3oC               87 %          (big digits)
+    #   EVERY 57s  LAST 18s  RX 42
+    #   BATTERY OK                           (no battery state: none)
+    bold(ROW(0, 9), 0, 0),
+    tiny("T_CH", 66, 1), tiny(ROW(10, 1), 74, 1), tiny("T_ID", 82, 1), tiny(ROW(12, 3), 90, 1),
+    (FN_INV, COL("C_POS"), 106, 0, 0, 1, 106 + 4 * 5, (CARD_ON, CARD_ON)),
+    tiny(COL("C_TD"), 0, 9),
+    tiny("T_MIN", 48, 9), tiny(COL("C_MIN"), 64, 9), tiny("T_MAX", 88, 9), tiny(COL("C_MAX"), 104, 9),
+    big(ROW(16, 5), 0, 2),
+    tiny("T_DEG", 57, 15), bold("T_C", 61, 2),
+    big(ROW(23, 3), 76, 2), bold(ROW(26, 1), 116, 2),
+    tiny("T_EVERY", 0, 33, (CARD_ON | 128, CARD_ON | 128)), tiny(COL("C_EVERY"), 24, 33),
+    tiny("T_LAST", 44, 33), tiny(ROW(28, 3), 64, 33),
+    tiny("T_RX", 84, 33), tiny(COL("C_RX"), 96, 33),
+    tiny("T_BOK", 0, 41, (CARD_ON | NOBAT | LOW, CARD_ON)),
+    tiny("T_BLOW", 0, 41, (CARD_ON | NOBAT | LOW, CARD_ON | LOW)),
+]
+# The key help, in table rows 3-5 while they are free (3 sensors or fewer,
+# not the card), 1 px from the left edge.  Its texts are an asset of their
+# own, which draw() reads into the row buffer then (a piece's src is one
+# byte, and the UI texts fill the rest of draw()'s buffer): HLP(text) names a
+# slice of it.
+#   MENU details
+#   1 speaker 2 clear 3 sensitivity
+#   5 AUTO/VFO
+HELP_TEXTS = ["MENU details", "1 speaker", "2 clear", "3 sensitivity", "5 AUTO/VFO"]
+help_blob = "".join(HELP_TEXTS).encode("ascii")
+assert len(help_blob) <= ROW_BUF
+def HLP(text):
+    return ("help", "".join(HELP_TEXTS).index(text), len(text))
+PIECES += [
+    tiny(HLP("MENU details"), 1, 25, (HELP, HELP)),
+    tiny(HLP("1 speaker"), 1, 33, (HELP, HELP)), tiny(HLP("2 clear"), 41, 33, (HELP, HELP)),
+    tiny(HLP("3 sensitivity"), 73, 33, (HELP, HELP)),
+    tiny(HLP("5 AUTO/VFO"), 1, 41, (HELP, HELP)),
+]
+PIECE_SIZE = 10
 
 # ---- timing families ----------------------------------------------------------
 # (name, kind, bit threshold, brk, end, glitch run, pulse, longest pulse) + a
@@ -102,12 +208,13 @@ FAMILIES = [
 ]
 
 # ---- checks -------------------------------------------------------------------
-# (kind, ca, cb, cc, cfl, sub): check() in temp433_app.c runs one loop for
-# both kinds, x from cb, x += key (C_SUM) or x ^= key (C_DIGEST) for every 1
-# of the first c1 bits, the key from ca stepped back after each bit as an
-# LFSR with cc; cfl bit 0: the key starts over every 8 bits, bit 3: the key
-# is ca << 8 (pack() adds bits 6-7 for F_LSB); nibble `sub` read from bits
-# 36-39 (NO_SUB: none).
+# (kind, ca, cb, cc, cfl, sub): one loop for both kinds, x from cb, x += key
+# (C_SUM) or x ^= key (C_DIGEST) for every 1 of the first c1 bits, the key
+# from ca stepped back after each bit as an LFSR with cc; cfl bit 0: the key
+# starts over every 8 bits, bit 3: the key is ca << 8 (pack() adds bits 6-7
+# for F_LSB); nibble `sub` read from bits 36-39 (NO_SUB: none).  weights()
+# runs that loop once here: check() in temp433_app.c only adds (XORs) the
+# weight of each 1 bit, the key that loop gives it.
 C_NONE, C_SUM, C_DIGEST = range(3)
 NO_SUB = 0xFF
 
@@ -148,13 +255,15 @@ def lfsr_digest_fwd(gen, key):
     the loop of check() itself"""
     return (C_DIGEST, key, 0, gen, 0, NO_SUB)
 
-# temperature: t_fl flags, t_off x 10 below 0 C (0.1 C) or below 32 F (0.1 F)
+# temperature: t_fl flags, t_off x 10 below 0 C (0.1 C) or below 32 F (0.1 F);
+# pack() turns them into the t_off of temperature() in temp433_app.c
 T_SIGNED, T_DEC, T_F = 1, 4, 8
 T_LE = 2                          # the temperature nibbles last to first: pack() only (x 12)
 S12 = (T_SIGNED, 0)
 F900 = (T_F, 122)                # 0.1 F + 900, i.e. 1220 below 32 F
 F_CH1, F_BATOK, F_HBCD = 1, 2, 8
 F_HSWAP = 4                       # the humidity nibbles swapped: pack() only (x 4)
+F_NOBAT = 4                       # after pack() (F_HSWAP's bit): no battery state sent (battery None)
 F_HREJ, F_CHNZ = 16, 32           # rtl_433 drops a frame with a humidity over 100 % / channel 0
 F_LSB = 64                        # the fields of 4 bits or more LSB first, the nibbles of the check too:
                                   # pack() only (x 3/7/15, cfl)
@@ -163,7 +272,7 @@ F_FIXNE = 128                     # the fixed bits must NOT hold the value
 # name (<= 9 chars), family, bits min/max, skip, flags, repeats,
 # check (kind, ca, cb, cc, cfl, sub) with c1 (bits checked), cpos and cw (the check field),
 # fixed (pos, len, value) from the row start, id (pos, len), channel (pos, len),
-# battery bit, temp (pos, flags, offset), hum (pos, bits[, offset subtracted])
+# battery bit (None: none sent), temp (pos, flags, offset), hum (pos, bits[, offset subtracted])
 P = []
 def proto(name, fam, bits, skip, flags, reps, check, c, fixed, ident, ch, bat, temp, hum):
     P.append((name, fam, bits, skip, flags, reps, check, c, fixed, ident, ch, bat, temp, hum))
@@ -254,7 +363,7 @@ proto("EMOS", 6, (120, 120), 0, F_CH1 | F_BATOK, 1, BYTE_SUM, (104, 104, 8),
 # kin, 11 nibbles 0 A type id(7) parity v1 v2 v3 v1 v2 sum; type 0 is the
 # temperature (decimal, + 50 C); the humidity messages (type E) are left out
 proto("LACROSSE", 7, (44, 44), 0, 0, 1, NIBBLE_SUM, (40, 40, 4),
-      (0, 12, 0x0A0), (12, 7), (0, 0), 0, (20, T_DEC, 50), (0, 0))      # La Crosse TX3/TX4/TX6U/TX7U: temperature
+      (0, 12, 0x0A0), (12, 7), (0, 0), None, (20, T_DEC, 50), (0, 0))   # La Crosse TX3/TX4/TX6U/TX7U: temperature
 
 assert len(P) <= 24                 # an arbitrary bound: match() reads them all per family
 
@@ -264,13 +373,30 @@ assert len(P) <= 24                 # an arbitrary bound: match() reads them all
 # nibble) count from the first data bit, check() adds the skip to them.
 FIELDS = ("fix", "id", "ch", "bat", "t", "h")        # V_FIX .. V_H
 V_T, V_H = 4, 5
-ROW_BITS = 128                                       # ROWS_BYTES x 8
+ROW_BITS = 120                                       # ROW_BITS: the last of the 16 row bytes is its count
+
+def weights(o, kind, name):
+    """the check loop (o: its constants) run once: the weight check() in
+    temp433_app.c adds (XORs) for a 1 at each data bit, 0 where the loop reads
+    no bit.  Its low byte: the check field has at most 8 bits, a C_SUM key at
+    most 128 (GT-WT-03's 16-bit key leaves the low byte to the field)"""
+    k0 = o["ca"] << (o["cfl"] & 8)
+    key, w = k0, {}
+    for pos in range(o["c1"]):
+        q = 36 + (pos & 3) if (pos >> 2) == o["csub"] else pos
+        q ^= o["cfl"] >> 6
+        assert q not in w and (kind != C_SUM or key < 256), name
+        w[q] = key & 0xFF
+        key = (key >> 1) ^ o["cc"] if key & 1 else key >> 1
+        if o["cfl"] & 1 and (pos & 7) == 7:
+            key = k0
+    return bytes(w.get(q, 0) for q in range(max(w) + 1 if w else 0))
 
 def pack(entry):
     (name, fam, (bmin, bmax), skip, flags, reps, (ck, ca, cb, cc, cfl, sub), (c1, cpos, cw), fixed, ident, ch,
      bat, (tpos, tfl, toff), hum) = entry
     fp, fl, fv = fixed or (0, 0, 0)
-    fld = [(fp, fl), (ident[0] + skip, ident[1]), (ch[0] + skip, ch[1]), (bat + skip, 1), (tpos + skip, 12),
+    fld = [(fp, fl), (ident[0] + skip, ident[1]), (ch[0] + skip, ch[1]), (0, 0) if bat is None else (bat + skip, 1), (tpos + skip, 12),
            (hum[0] + skip, hum[1])]
     fld = [(pos if n else 0, n) for pos, n in fld]
     r = dict(fam=fam, bmin=bmin, bmax=bmax, skip=skip, flags=flags, reps=reps, check=ck, c1=c1, cpos=cpos + skip,
@@ -278,7 +404,7 @@ def pack(entry):
              h_off=hum[2] if len(hum) > 2 else 0)
     assert all(0 <= v < 256 for k, v in r.items() if k not in ("fld", "fix_v")), name
     assert all(n <= 15 and pos + n <= ROW_BITS for pos, n in fld), name   # n: 4 bits of the length byte
-    assert bmax < ROW_BITS and cw <= 8 and r["cpos"] + cw <= ROW_BITS, name
+    assert bmax <= ROW_BITS and cw <= 8 and r["cpos"] + cw <= ROW_BITS, name   # ROW_BITS + 1: longer
     assert skip + max(c1, 40 if sub != NO_SUB else 0) <= ROW_BITS, name
     assert 0 <= fv < 1 << fl and len(name) < NAME_W, name
     assert sub == NO_SUB or 4 * sub + 4 <= c1, name   # the nibble is one of the checked
@@ -305,15 +431,31 @@ def pack(entry):
         r["fld"][V_H] = order(fld[V_H][0], 8, False, 4)
     r["cpos"], r["cw"] = order(r["cpos"], cw, lsb)
     if lsb:
-        r["cfl"] |= 3 << 6            # check() XORs the bit index with 3: the nibble weights reversed
+        r["cfl"] |= 3 << 6            # the bit index XOR 3: the nibble weights reversed
     r["flags"] &= ~(F_LSB | F_HSWAP)  # the order is in the fields now
     r["t_fl"] &= ~T_LE
+    if bat is None:                   # no battery bit: the card leaves the battery out
+        r["flags"] |= F_NOBAT         # (the bit of F_HSWAP, cleared above: match() reads it)
+    # check(): a weight per data bit (the loop's constants stay for the self-check)
+    r["old"] = dict(c1=c1, ca=r.pop("ca"), cc=r.pop("cc"), cfl=r.pop("cfl"), csub=r.pop("csub"))
+    r["keys"] = weights(r["old"], ck, name)
+    r["c1"] = len(r["keys"])
+    assert skip + r["c1"] <= ROW_BITS and r["c1"] < 256, name
+    # temperature(): (t ^ T_SIGNED << 11) - t_off, so t_off is 2048 for two's
+    # complement, else the offset x 10, and 720 less for F (the -40 F the
+    # conversion rounds from)
+    if tfl & T_SIGNED:
+        assert not toff and not tfl & (T_DEC | T_F), name
+        r["t_off"] = 2048
+    else:
+        r["t_off"] = toff * 10 - (720 if tfl & T_F else 0)
+        assert 0 <= r["t_off"] < 1 << 16, name
     return r
 
 def blob(r):
-    return struct.pack("<14B12BH4B", r["fam"], r["bmin"], r["bmax"], r["skip"], r["flags"], r["reps"],
-                       r["check"], r["c1"], r["cpos"], r["cw"], r["ca"], r["cb"], r["cc"], r["cfl"],
-                       *(v for f in r["fld"] for v in f), r["fix_v"], r["t_fl"], r["t_off"], r["csub"], r["h_off"])
+    return struct.pack("<12BH12BH2BH", r["fam"], r["bmin"], r["bmax"], r["skip"], r["flags"], r["reps"],
+                       r["check"], r["c1"], r["cpos"], r["cw"], r["cb"], 0, r["ktab"],
+                       *(v for f in r["fld"] for v in f), r["fix_v"], r["t_fl"], r["h_off"], r["t_off"])
 
 RECORDS = [pack(e) for e in P]
 
@@ -331,21 +473,72 @@ def _field(b, pos, n):
         v = v << 1 | b[pos + (i ^ (n >> 4))]
     return v
 
-def _check(r, b):
-    """check() in temp433_app.c, on the packed record r"""
-    k0 = r["ca"] << (r["cfl"] & 8)
-    x, key = r["cb"], k0
+def _x(r, b):
+    """the x of check() in temp433_app.c: the weights of the 1 bits"""
+    x = r["cb"]
     for pos in range(r["c1"]):
-        q = 36 + (pos & 3) if (pos >> 2) == r["csub"] else pos
-        q ^= r["cfl"] >> 6
+        if b[r["skip"] + pos]:
+            x = (x + r["keys"][pos]) & 0xFFFF if r["check"] == C_SUM else x ^ r["keys"][pos]
+    return x
+
+def _x_old(r, b):
+    """the x of check() up to v0.3, the loop itself (the reference for the weights)"""
+    o = r["old"]
+    k0 = o["ca"] << (o["cfl"] & 8)
+    x, key = r["cb"], k0
+    for pos in range(o["c1"]):
+        q = 36 + (pos & 3) if (pos >> 2) == o["csub"] else pos
+        q ^= o["cfl"] >> 6
         if b[r["skip"] + q]:
             x = (x + key) & 0xFFFF if r["check"] == C_SUM else x ^ key
-        key = (key >> 1) ^ r["cc"] if key & 1 else key >> 1
-        if r["cfl"] & 1 and (pos & 7) == 7:
+        key = (key >> 1) ^ o["cc"] if key & 1 else key >> 1
+        if o["cfl"] & 1 and (pos & 7) == 7:
             key = k0
+    return x
+
+def _check(r, b):
+    """check() in temp433_app.c, on the packed record r"""
+    x = _x(r, b)
     if r["check"] == C_SUM and not x:
         return False
     return (x & ((1 << (r["cw"] & 15)) - 1)) == _field(b, r["cpos"], r["cw"])
+
+def _temp(r, t):
+    """temperature() in temp433_app.c (C unsigned arithmetic, then int16)"""
+    fl = r["t_fl"]
+    if fl & T_DEC:
+        t = t - 6 * (t >> 4) - 60 * (t >> 8)
+    t = ((t ^ ((fl & T_SIGNED) << 11)) - r["t_off"]) & 0xFFFF
+    if fl & T_F:
+        t = ((t * 5 + 4) // 9 - 400) & 0xFFFF
+    return t - 65536 if t >= 32768 else t
+
+def _temp_old(tfl, toff, t):
+    """temperature() up to v0.3 (the reference for _temp)"""
+    if tfl & T_DEC:
+        t = ((t >> 8) * 10 + ((t >> 4) & 15)) * 10 + (t & 15)
+    if tfl & T_SIGNED:
+        return t - 4096 if t & 0x800 else t
+    t = (t - toff * 10) & 0xFFFF
+    if tfl & T_F:
+        t = ((((t + 720) & 0xFFFF) * 5 + 4) // 9 - 400) & 0xFFFF
+    return t - 65536 if t >= 32768 else t
+
+# the weights against the loop on random rows (x itself: all of a sum, the
+# low byte of a digest, the most a check field has), the temperature on every
+# 12-bit value (the field has 12 bits)
+seed = 0x2468ACE
+for _ in range(256):
+    row = []
+    for _ in range(ROW_BITS):
+        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+        row.append(seed >> 30 & 1)
+    row += [0] * 8                        # the count byte reads as no bits
+    for e, r in zip(P, RECORDS):
+        mask = 0xFFFF if r["check"] == C_SUM else 0xFF
+        assert (_x(r, row) ^ _x_old(r, row)) & mask == 0, e[0]
+for (name, *_, (tpos, tfl, toff), hum), r in zip(P, RECORDS):
+    assert all(_temp(r, t) == _temp_old(tfl & ~T_LE, toff, t) for t in range(4096)), name
 
 def _sum(b, skip, c1, w):
     """the w-bit units of the first c1 bits added up, the last one zero padded"""
@@ -465,32 +658,90 @@ for _ in range(64):
 
 fam_blob = b"".join(struct.pack("<8B", kind, thr, brk, end, glitch, pulse, pmax, 0)
                     for (_, kind, thr, brk, end, glitch, pulse, pmax) in FAMILIES)
+trend_blob = b"".join(bytes(v) for v in TREND)
+name_blob = b"".join(p[0].ljust(NAME_W).encode("ascii") for p in P)   # read into the row
+
+a = Assets("TEMP433")
+# The UI block, first in the assets: the texts the code reads (with a NUL),
+# then the piece texts with none, longest first, each where its bytes already
+# are when they are (dB in dBm): a piece's src is one byte, an offset into
+# draw()'s buffer, and the row with the card's values takes 72 of its 256.
+UIT = dict(UI)
+assert set(UIT) == {p[1] for p in PIECES if isinstance(p[1], str)} | set(UI_CODE), "a UI text unused"
+ui_blob, ui_at = b"", {}
+for name in UI_CODE:
+    ui_at[name] = len(ui_blob)
+    ui_blob += UIT[name].encode("ascii") + b"\0"
+for name in sorted(set(UIT) - set(UI_CODE), key=lambda n: -len(UIT[n])):
+    t = UIT[name].encode("ascii")
+    i = ui_blob.find(t)
+    if i < 0:
+        i, ui_blob = len(ui_blob), ui_blob + t
+    ui_at[name] = i
+a.prefix("UI", ui_blob)
+for name in UI_CODE:
+    a.const(name, ui_at[name])
+ui_size = len(ui_blob)
+
+# The piece list (PIECES, the last block): src is an offset into draw()'s
+# buffer, the row (ROW_BUF bytes) and then the UI texts
+def piece(fn, text, x, a1, a2, a3, a4, cond):
+    if isinstance(text, str):
+        src, n = ROW_BUF + ui_at[text], len(UIT[text])
+    elif text[0] == "help":                     # the key help, read into the row buffer
+        src, n = text[1:]
+    else:
+        src, n = text
+        # the row's columns (the ! at 31 left out), or the card's values after its NUL
+        assert src + n <= 31 or src > 32 and src + n <= ROW_BUF, text
+    assert src + n < 256 and 0 < n and x < 128 and cond[1] & ~cond[0] == 0, text
+    assert fn != FN_TINY or a2 or x + 4 * n - 1 <= 128, text      # the 3x5 font fits the screen
+    return bytes((fn, src, n, x, a1, a2, a3, a4) + cond)
+pieces_blob = b"".join(piece(*c) for c in PIECES) + b"\0"
+assert all(len(piece(*c)) == PIECE_SIZE for c in PIECES)
+a.const("UI_SIZE", ui_size)
+a.const("ROW_BUF", ROW_BUF)
+for name, (col, _) in COLS.items():
+    a.const(name, col)
+a.const("PIECE_SIZE", PIECE_SIZE)
+for name in ("FN_BOLD", "FN_TINY", "FN_INV", "FN_BIG", "FN_BATT"):
+    a.const(name, globals()[name])
+
+# The check weights after the records, each table where its bytes already are
+# when they are (the nibble sums share the start of one table): ktab is
+# absolute, so the offset of the block is set from the sizes before it.
+keys_at = ui_size + len(fam_blob) + len(trend_blob) + len(status) + len(name_blob) + 32 * len(P)
+keys_blob = b""
+for r in sorted(RECORDS, key=lambda r: -len(r["keys"])):
+    i = keys_blob.find(r["keys"])
+    if i < 0:
+        i, keys_blob = len(keys_blob), keys_blob + r["keys"]
+    r["ktab"] = keys_at + i
 proto_blob = b"".join(blob(r) for r in RECORDS)
 assert len(proto_blob) == 32 * len(P)
 
-a = Assets("TEMP433")
-ui_size = 0
-for name, text in UI:
-    pad = -(len(text) + 1) % 4                 # keeps every offset word-aligned
-    a.text(name, text + "\0" * pad)
-    ui_size += len(text) + 1 + pad
-a.const("UI_SIZE", ui_size)
-a.const("T_TITLE_CHARS", len(UI[0][1]))
-# The fixed blocks first, so as many offsets as fit stay below 256 (a movs in
-# Thumb-1, a literal word above); the per-protocol ones last, so a new
-# protocol moves no other offset.
+# The small blocks first, so as many offsets as fit stay below 256 (a movs in
+# Thumb-1, a literal word above): the names start at 254, the status bitmaps
+# (a new protocol moves them by 10, past 255 anyway) after them, the records,
+# weights and the piece list last (measured: names after the bitmaps cost 4
+# B; the card pieces after the texts 8 B less code, but 136 B more stack in
+# draw(), which reads the texts and the row into one block).
 a.raw("FAMS", fam_blob)
 a.const("FAM_SIZE", 8)
 a.const("FAM_COUNT", len(FAMILIES))
-a.raw("BMP_BARS", b"".join(bytes(v) for v in BARS))
-a.const("BARS_W", len(BARS[0]))
-a.raw("BMP_TREND", b"".join(bytes(v) for v in TREND))
+a.raw("BMP_TREND", trend_blob)
 a.const("TREND_W", len(TREND[0]))
-a.raw("BMP_TAIL", tails)
-a.const("TAIL_W", 18)
-a.raw("T_NAME", b"".join(p[0].ljust(NAME_W).encode("ascii") for p in P))   # read into the row
+a.raw("T_NAME", name_blob)
 a.const("T_NAME_STRIDE", NAME_W)
+a.raw("BMP_STATUS", status)
+a.const("STATUS_W", STATUS_W)
 a.raw("PROTOS", proto_blob)
 a.const("PROTO_SIZE", 32)
 a.const("PROTO_COUNT", len(P))
+a.raw("KEYS", keys_blob)
+a.raw("HELP", help_blob)
+a.const("HELP_SIZE", len(help_blob))
+a.raw("PIECES", pieces_blob)                   # draw() reads it piece by piece
+a.const("KEY_MAX", max(len(r["keys"]) for r in RECORDS))   # check() reads them onto the stack
+assert dict((n, o) for n, o, _ in a.build()[1])["KEYS"] == keys_at
 a.main()
