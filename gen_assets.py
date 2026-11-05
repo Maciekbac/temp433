@@ -37,9 +37,12 @@ def mid(a_us, b_us):
     """bit threshold between two times: a run longer than it is the long one"""
     return (a_us + b_us) // (2 * US)
 
-# The screen texts, each padded to a multiple of 4 bytes: draw() reads them in
-# one asset_read into a word-aligned stack block.
+# The screen texts, read by draw() in one asset_read after the row.  The code
+# reads T_RANGE and T_DBM as strings (with a NUL); the pieces cut the others
+# by length, so they are packed with no NUL, each where its bytes already are
+# when they are (see the UI block below).
 RANGE = "433.80-434.04"          # AUTO: F_FIRST and N_PTS in temp433_app.c
+UI_CODE = ("T_RANGE", "T_DBM")
 UI = [
     ("T_TITLE",  "TEMP 433"),
     ("T_AUTO",   "AUTO "),
@@ -54,10 +57,13 @@ UI = [
     ("T_ID",     "ID"),
     ("T_DEG",    "o"),                                    # the 3x5 o, raised: a degree sign
     ("T_C",      "C"),
+    ("T_MIN",    "MIN"),
+    ("T_MAX",    "MAX"),
+    ("T_EVERY",  "EVERY"),
     ("T_BOK",    "BATTERY OK"),
     ("T_BLOW",   "BATTERY LOW"),
-    ("T_HEARD",  "HEARD"),
-    ("T_AGO",    "AGO"),
+    ("T_RX",     "RX"),
+    ("T_LAST",   "LAST"),
 ]
 NAME_W = 10                      # model names, space padded: table columns 0-9
 
@@ -82,10 +88,11 @@ for bars in BARS:                  # sens * 8 + tail
 STATUS_W = 27
 assert len(status) == 3 * 8 * STATUS_W
 
-# The trend arrows of the bottom line, rows 3-5 of the frame buffer line it
-# is printed on (the text there: rows 2-6).
-TREND = [[0x20, 0x30, 0x38, 0x30, 0x20],    # up
-         [0x08, 0x18, 0x38, 0x18, 0x08]]    # down
+# The trend marks of the card, rows 2-4 of frame buffer line 1 (its text:
+# rows 1-5), in the order draw() picks them by the sign of the change.
+TREND = [[0x04, 0x0C, 0x1C, 0x0C, 0x04],    # down
+         [0x14, 0x14, 0x14, 0x14, 0x14],    # no change: =
+         [0x10, 0x18, 0x1C, 0x18, 0x10]]    # up
 
 # The fixed texts of the screen and the card of the selected sensor (MENU),
 # drawn by draw() in temp433_app.c: pieces of UI texts or of the table row,
@@ -95,18 +102,27 @@ TREND = [[0x20, 0x30, 0x38, 0x30, 0x20],    # up
 # EMPTY (no sensor yet), AUTO.  Pieces of the row: ROW(column, length); its
 # columns: 0-8 model, 10 channel, 12-14 ID, 16-20 temperature
 # (right-aligned), 21 C, 23-25 humidity (right-aligned or --), 26 % (a space
-# without humidity), 27-30 age.  x in pixels; the 3x5 font by y from the
-# frame buffer top (line l at 8 l; status: the status line), the others by
-# line.  The big digits (display_freq) take 13 px a cell and 3 px the point,
-# lines l and l + 1, a leading space an empty cell: the temperature always
-# 55 px.
+# without humidity), 27-30 age, 32 its NUL; on the card the values draw()
+# writes after it, left-aligned: COL(name) (see COLS).  x in pixels; the 3x5
+# font by y from the frame buffer top (line l at 8 l; status: the status
+# line), the others by line.  The big digits (display_freq) take 13 px a cell
+# and 3 px the point, lines l and l + 1, a leading space an empty cell: the
+# temperature always 55 px.
 FN_BOLD, FN_TINY, FN_INV, FN_BIG, FN_BATT = 6, 7, 16, 17, 30
 # print_bold(s, x, end, line), print_tiny(s, x, y, statusbar, fill), print_inverse(s, x, line,
 # statusbar, fill, end_x), display_freq(s, x, line, center), draw_battery()
-LOW, NOBAT, CARD_ON, VHF, EMPTY, AUTO = 1, 2, 4, 8, 16, 32    # S_CARD, S_EMPTY in temp433_app.c
-ROW_BUF = 36                           # draw(): the row, then the UI block
+LOW, NOBAT, CARD_ON, VHF, EMPTY, AUTO, HELP = 1, 2, 4, 8, 16, 32, 64    # S_CARD, S_EMPTY, S_HELP in temp433_app.c
+# the card's values (column, width): its place in the list ("3/12"),
+# readings, the period, min, max, the trend (2 cells for its mark, then
+# "0.3C/14m")
+COLS = dict(C_POS=(33, 5), C_RX=(41, 3), C_EVERY=(44, 3),
+            C_MIN=(50, 5), C_MAX=(55, 5), C_TD=(60, 12))
+ROW_BUF = 72                           # draw(): the row and the values, then the UI block
+assert max(c + n for c, n in COLS.values()) <= ROW_BUF and ROW_BUF % 4 == 0
 def ROW(col, n):
     return (col, n)
+def COL(name):
+    return COLS[name]
 def bold(text, x, line, cond=(CARD_ON, CARD_ON)):
     return (FN_BOLD, text, x, 0, line, 0, 0, cond)
 def tiny(text, x, y, cond=(CARD_ON, CARD_ON), status=0):
@@ -119,19 +135,47 @@ PIECES = [
     (FN_BATT, ROW(0, 1), 0, 0, 0, 0, 0, (0, 0)),            # the radio's battery (no text)
     tiny("T_AUTO", 37, 1, (AUTO, AUTO), 1), tiny("T_VFO", 37, 1, (AUTO, 0), 1),
     # on VHF only these two lines; in VFO with no sensor yet the hint to search
-    tiny("T_VHF1", 0, 17, (VHF, VHF)), tiny("T_VHF2", 0, 25, (VHF, VHF)),
-    tiny("T_HINT", 0, 17, (VHF | EMPTY | AUTO, EMPTY)),
-    # the card
-    bold(ROW(0, 9), 0, 0),                                   # NEXUS
-    tiny("T_CH", 80, 1), tiny(ROW(10, 1), 92, 1),            #          CH 1  ID 136
-    tiny("T_ID", 104, 1), tiny(ROW(12, 3), 116, 1),
-    big(ROW(16, 5), 0, 2),                                   # -12.3
-    tiny("T_DEG", 57, 15), bold("T_C", 61, 2),               #      oC
-    big(ROW(23, 3), 76, 2), bold(ROW(26, 1), 116, 2),        #             87 %
-    tiny("T_BOK", 0, 41, (CARD_ON | NOBAT | LOW, CARD_ON)),  # BATTERY OK
+    # (1 px from the left edge, as the key help)
+    tiny("T_VHF1", 1, 17, (VHF, VHF)), tiny("T_VHF2", 1, 25, (VHF, VHF)),
+    tiny("T_HINT", 1, 17, (VHF | EMPTY | AUTO, EMPTY)),
+    # the card:
+    #   NEXUS            CH1 ID136 [3/12 ]  (the longest bold name ends at 63)
+    #   v0.3C/14m  MIN -3.1  MAX 9.0         (the mark drawn by draw())
+    #    -12.3oC               87 %          (big digits)
+    #   EVERY 57s  LAST 18s  RX 42
+    #   BATTERY OK                           (no battery state: none)
+    bold(ROW(0, 9), 0, 0),
+    tiny("T_CH", 66, 1), tiny(ROW(10, 1), 74, 1), tiny("T_ID", 82, 1), tiny(ROW(12, 3), 90, 1),
+    (FN_INV, COL("C_POS"), 106, 0, 0, 1, 106 + 4 * 5, (CARD_ON, CARD_ON)),
+    tiny(COL("C_TD"), 0, 9),
+    tiny("T_MIN", 48, 9), tiny(COL("C_MIN"), 64, 9), tiny("T_MAX", 88, 9), tiny(COL("C_MAX"), 104, 9),
+    big(ROW(16, 5), 0, 2),
+    tiny("T_DEG", 57, 15), bold("T_C", 61, 2),
+    big(ROW(23, 3), 76, 2), bold(ROW(26, 1), 116, 2),
+    tiny("T_EVERY", 0, 33, (CARD_ON | 128, CARD_ON | 128)), tiny(COL("C_EVERY"), 24, 33),
+    tiny("T_LAST", 44, 33), tiny(ROW(28, 3), 64, 33),
+    tiny("T_RX", 84, 33), tiny(COL("C_RX"), 96, 33),
+    tiny("T_BOK", 0, 41, (CARD_ON | NOBAT | LOW, CARD_ON)),
     tiny("T_BLOW", 0, 41, (CARD_ON | NOBAT | LOW, CARD_ON | LOW)),
-    tiny("T_HEARD", 76, 41), tiny(ROW(27, 4), 96, 41),       #          HEARD  18s AGO
-    tiny("T_AGO", 116, 41),
+]
+# The key help, in table rows 3-5 while they are free (3 sensors or fewer,
+# not the card), 1 px from the left edge.  Its texts are an asset of their
+# own, which draw() reads into the row buffer then (a piece's src is one
+# byte, and the UI texts fill the rest of draw()'s buffer): HLP(text) names a
+# slice of it.
+#   MENU details
+#   1 speaker 2 clear 3 sensitivity
+#   5 AUTO/VFO
+HELP_TEXTS = ["MENU details", "1 speaker", "2 clear", "3 sensitivity", "5 AUTO/VFO"]
+help_blob = "".join(HELP_TEXTS).encode("ascii")
+assert len(help_blob) <= ROW_BUF
+def HLP(text):
+    return ("help", "".join(HELP_TEXTS).index(text), len(text))
+PIECES += [
+    tiny(HLP("MENU details"), 1, 25, (HELP, HELP)),
+    tiny(HLP("1 speaker"), 1, 33, (HELP, HELP)), tiny(HLP("2 clear"), 41, 33, (HELP, HELP)),
+    tiny(HLP("3 sensitivity"), 73, 33, (HELP, HELP)),
+    tiny(HLP("5 AUTO/VFO"), 1, 41, (HELP, HELP)),
 ]
 PIECE_SIZE = 10
 
@@ -618,28 +662,47 @@ trend_blob = b"".join(bytes(v) for v in TREND)
 name_blob = b"".join(p[0].ljust(NAME_W).encode("ascii") for p in P)   # read into the row
 
 a = Assets("TEMP433")
-ui_size, ui_at = 0, {}
-for name, text in UI:
-    pad = -(len(text) + 1) % 4                 # keeps every offset word-aligned
-    a.text(name, text + "\0" * pad)
-    ui_at[name] = ui_size
-    ui_size += len(text) + 1 + pad
-a.const("T_TITLE_CHARS", len(UI[0][1]))
+# The UI block, first in the assets: the texts the code reads (with a NUL),
+# then the piece texts with none, longest first, each where its bytes already
+# are when they are (dB in dBm): a piece's src is one byte, an offset into
+# draw()'s buffer, and the row with the card's values takes 72 of its 256.
+UIT = dict(UI)
+assert set(UIT) == {p[1] for p in PIECES if isinstance(p[1], str)} | set(UI_CODE), "a UI text unused"
+ui_blob, ui_at = b"", {}
+for name in UI_CODE:
+    ui_at[name] = len(ui_blob)
+    ui_blob += UIT[name].encode("ascii") + b"\0"
+for name in sorted(set(UIT) - set(UI_CODE), key=lambda n: -len(UIT[n])):
+    t = UIT[name].encode("ascii")
+    i = ui_blob.find(t)
+    if i < 0:
+        i, ui_blob = len(ui_blob), ui_blob + t
+    ui_at[name] = i
+a.prefix("UI", ui_blob)
+for name in UI_CODE:
+    a.const(name, ui_at[name])
+ui_size = len(ui_blob)
 
 # The piece list (PIECES, the last block): src is an offset into draw()'s
 # buffer, the row (ROW_BUF bytes) and then the UI texts
 def piece(fn, text, x, a1, a2, a3, a4, cond):
     if isinstance(text, str):
-        src, n = ROW_BUF + ui_at[text], len(dict(UI)[text])
+        src, n = ROW_BUF + ui_at[text], len(UIT[text])
+    elif text[0] == "help":                     # the key help, read into the row buffer
+        src, n = text[1:]
     else:
         src, n = text
-        assert src + n <= 31, text              # the row's columns, the ! at 31 left out
+        # the row's columns (the ! at 31 left out), or the card's values after its NUL
+        assert src + n <= 31 or src > 32 and src + n <= ROW_BUF, text
     assert src + n < 256 and 0 < n and x < 128 and cond[1] & ~cond[0] == 0, text
+    assert fn != FN_TINY or a2 or x + 4 * n - 1 <= 128, text      # the 3x5 font fits the screen
     return bytes((fn, src, n, x, a1, a2, a3, a4) + cond)
 pieces_blob = b"".join(piece(*c) for c in PIECES) + b"\0"
 assert all(len(piece(*c)) == PIECE_SIZE for c in PIECES)
 a.const("UI_SIZE", ui_size)
 a.const("ROW_BUF", ROW_BUF)
+for name, (col, _) in COLS.items():
+    a.const(name, col)
 a.const("PIECE_SIZE", PIECE_SIZE)
 for name in ("FN_BOLD", "FN_TINY", "FN_INV", "FN_BIG", "FN_BATT"):
     a.const(name, globals()[name])
@@ -676,6 +739,8 @@ a.raw("PROTOS", proto_blob)
 a.const("PROTO_SIZE", 32)
 a.const("PROTO_COUNT", len(P))
 a.raw("KEYS", keys_blob)
+a.raw("HELP", help_blob)
+a.const("HELP_SIZE", len(help_blob))
 a.raw("PIECES", pieces_blob)                   # draw() reads it piece by piece
 a.const("KEY_MAX", max(len(r["keys"]) for r in RECORDS))   # check() reads them onto the stack
 assert dict((n, o) for n, o, _ in a.build()[1])["KEYS"] == keys_at

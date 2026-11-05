@@ -46,11 +46,12 @@
  * the order of a field's bits (LSB first, nibbles swapped) part of its record
  * (see bits()).
  *
- * Keys: UP/DOWN select a sensor (its frequency, level and temperature trend
- * in the bottom line), MENU its card (big digits; MENU or EXIT back, UP/DOWN
- * the next sensor), 1 speaker, 2 clear the table and the count of unknown
- * packets, 3 sensitivity (High 6 dB, Normal 10 dB, Low 15 dB above the
- * noise), 5 AUTO / VFO, EXIT quit.
+ * While the table has 3 sensors or fewer its free rows 3-5 show the keys.
+ * Keys: UP/DOWN select a sensor (its frequency and level in the bottom line),
+ * MENU its card (big digits, the trend, min/max, reception; MENU or EXIT
+ * back, UP/DOWN the next sensor), 1 speaker, 2 clear the table and the count
+ * of unknown packets, 3 sensitivity (High 6 dB, Normal 10 dB, Low 15 dB above
+ * the noise), 5 AUTO / VFO, EXIT quit.
  */
 
 #include <stdint.h>
@@ -118,8 +119,9 @@ enum { EMPTY, PACKET, DECODED };
 #define T_F         8u                 /* 0.1 F                                      */
 #define NO_HUM      0xFFu
 #define S_CARD      4u                 /* the state bits of draw()'s pieces: the card, */
-#define S_EMPTY     16u                /* no sensor yet (bit 3 VHF, bit 5 AUTO; bits */
-                                       /* 0-1 the card sensor's low)                 */
+#define S_EMPTY     16u                /* no sensor yet, the key help (bit 3 VHF, bit */
+#define S_HELP      64u                /* 5 AUTO; bits 0-1 the card sensor's low)    */
+#define S_EVERY     128u               /* the card: the sensor's period is known     */
 
 typedef struct {                       /* FAMS record of the assets (8 B)            */
     uint8_t kind;                      /* 0 PPM, 1 PWM (a long pulse is 1), 3 PWM    */
@@ -164,18 +166,24 @@ typedef struct {                       /* a row's count of bits in its last byte
 #define RBITS(rs, k) ((rs)->bytes[k][ROW_BYTES - 1u])
 
 typedef struct {                       /* a reading, and a row of the sensor table  */
-    uint8_t proto, id, ch, low, hum, rssi;  /* low: bit 0 battery low, bit 1 none sent; rssi: dBm + 160 */
+    uint32_t seen;                     /* ticks_ms of the last one (first: 4 B less */
+                                       /* code than after the bytes)                */
+    uint8_t proto, id, ch, low, hum;   /* low: bit 0 battery low, bit 1 none sent   */
+    uint8_t rssi;                      /* dBm + 160                                 */
+    uint8_t rx, every, pt;             /* readings (up to 255), the shortest gap of */
+                                       /* 5 s or more in 1.024 s (0xFF: none yet),  */
+                                       /* the point (NO_PT: the VFO)                */
     int16_t t10;                       /* 0.1 C                                     */
-    uint32_t seen, f;                  /* ticks_ms of the last one, its frequency   */
+    int16_t tmin, tmax;                /* since the first reading                   */
     uint32_t ref, next;                /* trend (store()): t10 << 16 | ticks_ms >> 13 */
 } sensor_t;
 
 /* ---- screen ---- */
-#define N_SENS      48u                /* sensors kept; a new one replaces the one  */
+#define N_SENS      64u                /* sensors kept; a new one replaces the one  */
                                        /* heard longest ago.  On app_main's stack:  */
-                                       /* 24 B each; with 48 about 1.2 KB of stack  */
-                                       /* stays free (emulator, Labs v6.3.0; 2.1 KB */
-                                       /* with 12)                                  */
+                                       /* 28 B each; with 64 about 500 B of stack   */
+                                       /* stays free (emulator, Labs v6.3.0; the    */
+                                       /* user's choice: more sensors, less spare)  */
 #define ROWS_SHOWN  6u                 /* table rows, frame buffer lines 0-5        */
 #define SLOT        73u                /* trend: 10 min in 8.192 s ticks            */
 
@@ -658,7 +666,12 @@ static uint8_t decode(uint16_t n)
  * Trend: a reading kept as its temperature and its time in 8.192 s ticks (16
  * bits: 6 days around).  The reference starts as the first reading; once the
  * next one is SLOT old it takes over and this reading becomes the next, so
- * the reference is 10-20 min old (the first reading for the first 10-20 min) */
+ * the reference is 10-20 min old (the first reading for the first 10-20 min).
+ * The card's statistics count from the first reading: readings (they stay
+ * at 255), the shortest gap between two of them, 5 s or more (shorter: the
+ * same transmission caught twice; a lost packet only makes a gap longer, so
+ * the shortest is the sensor's period), and the lowest and highest
+ * temperature */
 static void store(void)
 {
     sensor_t *const t = g.tab, *const r = g.rd;
@@ -671,13 +684,26 @@ static void store(void)
     }
     const uint32_t now = (uint32_t)r->t10 << 16 | (uint16_t)(r->seen >> 13);
     r->ref = r->next = now;
+    r->rx = 1;
+    r->every = 0xFFu;
+    r->tmin = r->tmax = r->t10;
     if (i < g.n) {
-        r->ref = t[i].ref;
-        r->next = t[i].next;
+        const sensor_t *const o = t + i;
+        r->ref = o->ref;
+        r->next = o->next;
         if ((uint16_t)(now - r->next) >= SLOT) {
             r->ref = r->next;
             r->next = now;
         }
+        r->rx = (uint8_t)(o->rx + (o->rx != 0xFFu));
+        const uint32_t gap = (r->seen - o->seen + 512u) >> 10;   /* 1.024 s, rounded */
+        r->every = o->every;
+        if (gap >= 5u && gap < o->every)
+            r->every = (uint8_t)gap;
+        if (o->tmin < r->tmin)
+            r->tmin = o->tmin;
+        if (o->tmax > r->tmax)
+            r->tmax = o->tmax;
     } else if (i == N_SENS) {
         for (i = old; i + 1u < N_SENS; i++)
             t[i] = t[i + 1u];
@@ -723,7 +749,7 @@ static void grab(uint8_t p, uint8_t v)
     if (res == PACKET)
         g.unk++;
     if (res == DECODED) {
-        g.rd->f = freq(q);
+        g.rd->pt = g.is_auto ? q : NO_PT;
         g.rd->rssi = lv;
         g.rd->seen = now;
         store();
@@ -827,20 +853,21 @@ static char *put_age(char *o, uint32_t ms)
  *   model     ch id  temp  hum  age, low battery
  * or the card of the selected sensor (MENU): pieces of the same row in other
  * fonts and places (the model in bold, the temperature and humidity in the
- * big digits of the main screen, the battery and the age).  Every fixed text
- * of the screen (the title, AUTO / VFO, the VHF lines, the VFO hint) and the
- * card are pieces of one list of the assets (PIECES, gen_assets.py), drawn by
- * one loop, each when the screen's state bits say so.
- * Line 6: a dotted line, then the selected sensor's frequency, level and
- * trend (the range or the frequency while the table is empty), and the count
- * of unknown packets inverted at the right end:
- *   433.940 -103dBm ^0.3/14m      ?3 */
+ * big digits of the main screen, the battery and the age), and of the card's
+ * values written after the row's 32 columns (its place in the list, the
+ * temperature trend with its arrow, min/max, the period, the readings).  Every fixed text of the screen (the title, AUTO / VFO, the
+ * VHF lines, the VFO hint) and the card are pieces of one list of the assets
+ * (PIECES, gen_assets.py), drawn by one loop, each when the screen's state
+ * bits say so.
+ * Line 6: a dotted line, then the selected sensor's frequency and level (the
+ * range or the frequency while the table is empty), and the count of unknown
+ * packets inverted at the right end:
+ *   433.940 -103dBm               ?3 */
 __attribute__((noinline))
 static void draw(void)
 {
-    /* the row, then the UI texts in one asset read, word-aligned
-     * (gen_assets.py pads them); a piece names its text as an offset into
-     * this block */
+    /* the row (and the card's values after it), then the UI texts in one
+     * asset read; a piece names its text as an offset into this block */
     char buf[ROW_BUF + UI_SIZE] __attribute__((aligned(4)));
     char *const b = buf, *const s = buf + ROW_BUF, v[8];
     const app_api_t *const a = A;
@@ -867,7 +894,7 @@ static void draw(void)
         const uint8_t first = g.card ? g.sel : g.top;    /* the card: one row, */
         const sensor_t *e = g.tab + first;                /* built for its pieces */
         for (uint8_t r = 0; r < ROWS_SHOWN && (uint8_t)(first + r) < g.n; r++, e++) {
-            memset(b, ' ', 32);             /* the name, space padded in the assets */
+            memset(b, ' ', ROW_BUF);        /* the name, space padded in the assets */
             asset((uint16_t)(T_NAME + e->proto * T_NAME_STRIDE), b, T_NAME_STRIDE);
             b[10] = (char)('0' + e->ch);
             rput(b + 15, v, putu(v, e->id));
@@ -885,12 +912,46 @@ static void draw(void)
             b[32] = 0;
             if (g.card) {
                 fl |= S_CARD | e->low;
+                /* the card's values, left-aligned in their columns (spaces
+                 * after them): its place in the list, readings, the period
+                 * (with its label only once known), min and max */
+                char *o = putu(b + C_POS, g.sel + 1u);
+                *o++ = '/';
+                putu(o, g.n);
+                putu(b + C_RX, e->rx);
+                if (e->every != 0xFFu) {
+                    fl |= S_EVERY;
+                    put_age(b + C_EVERY, (uint32_t)e->every << 10);
+                }
+                put_t10(b + C_MIN, e->tmin);
+                put_t10(b + C_MAX, e->tmax);
+                /* the change of the temperature since the trend reference,
+                 * over how long (none for the first reading alone): one of
+                 * 3 arrows (down, =, up) by its sign, 5 px in the 2 cells
+                 * before it, on line 1 */
+                const unsigned span = (uint16_t)((e->seen >> 13) - e->ref);
+                if (span) {
+                    const int d = e->t10 - (int16_t)(e->ref >> 16);
+                    asset((uint16_t)(BMP_TREND + TREND_W + (unsigned)((d > 0) - (d < 0)) * TREND_W),
+                          a->fb[1] + 1, TREND_W);
+                    o = put_fixed(b + C_TD + 2, d < 0 ? -d : d, 10u);
+                    *o++ = 'C';
+                    *o++ = '/';
+                    put_age(o, span << 13);
+                }
                 break;
             }
             tiny(b, (uint8_t)(r * 8u + 1u));
             if ((uint8_t)(g.top + r) == g.sel)
                 for (unsigned x = 0; x < 128u; x++)
                     a->fb[r][x] ^= 0xFFu;
+        }
+        /* rows 3-5 free (3 sensors or fewer, not the card): the key help
+         * there, its texts (pieces too) read into the row buffer, which the
+         * rows above are done with */
+        if (!g.card && g.n <= 3u) {
+            fl |= S_HELP;
+            asset(HELP, b, HELP_SIZE);
         }
     }
     /* Each piece, read one at a time (read with the UI texts, the list saved
@@ -915,31 +976,17 @@ static void draw(void)
     if (g.vhf)
         return;
 
-    /* the selected sensor: where, how strong, and the change of its
-     * temperature since the trend reference, over how long; with no sensor
-     * the range ("433.80-434.04", a text of the assets) or the VFO frequency */
+    /* the selected sensor: where (its point of the sweep, NO_PT: the VFO)
+     * and how strong; with no sensor the range ("433.80-434.04", a text of
+     * the assets) or the VFO frequency */
     char *o;
     const sensor_t *const e = g.tab + g.sel;
     if (g.n || !g.is_auto) {
-        o = put_freq(b, g.n ? e->f : g.f0);
+        o = put_freq(b, g.n ? (e->pt == NO_PT ? g.vfo : F_FIRST + e->pt * F_STEP) : g.f0);
         if (g.n) {
             *o++ = ' ';
             *o++ = '-';
             o = put(putu(o, 160u - e->rssi), s + T_DBM);
-            const unsigned span = (uint16_t)((e->seen >> 13) - e->ref);
-            if (span) {                 /* not the first reading alone */
-                /* the arrow, 5 px wide, in a space and one more cell */
-                const int d = e->t10 - (int16_t)(e->ref >> 16);
-                o[0] = o[1] = ' ';
-                if (d)
-                    asset((uint16_t)(BMP_TREND + (d < 0 ? TREND_W : 0u)),
-                          a->fb[6] + 4u * (unsigned)(o - b) + 1u, TREND_W);
-                else
-                    o[1] = '=';
-                o = put_fixed(o + 2, d < 0 ? -d : d, 10u);
-                *o++ = '/';
-                o = put_age(o, span << 13);
-            }
         }
     } else {
         o = put(b, s + T_RANGE);
@@ -1022,7 +1069,7 @@ void app_main(const app_api_t *api)
     rows_t rows;
     uint16_t floorq[N_PTS];
     sensor_t tab[N_SENS + 1u];         /* the sensors, then the reading in decoding */
-                                       /* (49 x 24 B, the biggest block here)       */
+                                       /* (65 x 28 B, the biggest block here)       */
 
     A = api;
     g.runs = runs;

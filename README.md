@@ -12,15 +12,16 @@ A receive-only overlay app for the
 
 - Reads 19 kinds of 433 MHz thermometers and thermo-hygrometers (see
   [Supported sensors](#supported-sensors)).
-- A table of up to 48 sensors: model, channel, ID, temperature, humidity, the
+- A table of up to 64 sensors: model, channel, ID, temperature, humidity, the
   time since the last reading, and a low battery mark.
 - Searches the whole 433.80-434.04 MHz band (AUTO), or listens on the VFO
   frequency only.
-- For the selected sensor: the frequency it is heard on, its signal level, and
-  how its temperature changed over the last 10-20 minutes.
+- For the selected sensor: the frequency it is heard on and its signal level.
 - A card for the selected sensor (`MENU`): its temperature and humidity in big
-  digits, readable from across the room, with its battery state and the time
-  since its last reading.
+  digits, readable from across the room, how the temperature changed over the
+  last 10-20 minutes, its lowest and highest temperature, and how it is
+  received: how often it sends and how many readings came.
+- Until the table has four sensors, its free rows show the main keys.
 - Receive only: the app never transmits.
 
 ## Requirements
@@ -48,7 +49,9 @@ the whole band, because the sensors' frequencies spread up to ±75 kHz around
 ![AUTO, nothing heard yet](docs/start-auto.png)
 
 Most sensors transmit every 30-90 seconds, so the first rows come after a
-minute or two.
+minute or two. Until four sensors are in the table, its bottom rows list the
+main keys: `MENU` for a sensor's details, `1` speaker, `2` clear, `3`
+sensitivity and `5` AUTO / VFO.
 
 **2. Read the table.** Each heard sensor gets a row, in the order they were
 first heard:
@@ -72,25 +75,31 @@ below.
 bottom line shows that sensor's details:
 
 ```
-433.920 -84dBm ▼0.3/1m      ?3
+433.920 -84dBm              ?3
 ```
 
 - `433.920`: the frequency it was last heard on.
 - `-84dBm`: its signal level.
-- `▼0.3/1m`: the temperature trend. The last reading is compared with one
-  10-20 minutes older, or with the first one while the sensor has been heard
-  for less than that: `▲` up, `▼` down, `=` no change, then the change in °C
-  and over how long.
 - The inverted `?3` at the right counts the packets no decoder recognised:
   sensors of other kinds, or damaged frames. It is a count for the whole app,
   not for the selected sensor.
 
 **4. Open the card.** `MENU` shows the selected sensor in big digits, with
-its battery state and the time since its last reading; its details stay in the
-bottom line. UP and DOWN go to the next sensor's card, `MENU` or `EXIT` back to
-the table.
+everything the app knows about it; the bottom line stays as in the table. UP
+and DOWN go to the next sensor's card, `MENU` or `EXIT` back to the table.
 
 ![The card of a sensor](docs/card.png)
+
+| Item | Example | Meaning |
+|---|---|---|
+| `CH` / `ID` | `CH1 ID136` | the sensor's channel and ID, as in the table |
+| place | `1/6` | the sensor's place in the table, of how many |
+| trend | `▼0.3C/1m` | the last reading against one 10-20 minutes older (or the first one, for a sensor heard for less than that): `▲` up, `▼` down, `=` no change, then the change and over how long |
+| `MIN` / `MAX` | `MIN 8.1  MAX 8.4` | its lowest and highest temperature since it was first heard |
+| `EVERY` | `EVERY 9s` | how often it sends: the shortest gap between two readings, from 5 s up (shown from the second reading on) |
+| `LAST` | `LAST 19s` | time since the last reading |
+| `RX` | `RX 7` | readings received (it stops at 255) |
+| `BATTERY` | `BATTERY OK` | battery state, `LOW` when the sensor says so |
 
 **5. Listen on one frequency.** Started anywhere else on UHF, the app listens
 on the VFO frequency only (VFO mode) and, until a sensor is heard, reminds you
@@ -170,11 +179,13 @@ compared side by side, except for TFA-TWIN (see below).
   leaves those out, so its ID is another number for the same sensor.
 - LACROSSE shows the temperature only (the humidity comes in separate frames)
   and channel 0 (these sensors have none). Its frames carry no battery state,
-  so its card has no battery line.
+  so its card shows none.
 - ESPERANZA also reads Kedsum and Conrad S3318P sensors (the same frame); the
   battery state of a Kedsum may be shown wrongly.
-- The table keeps 48 sensors; a new one then replaces the one heard longest
+- The table keeps 64 sensors; a new one then replaces the one heard longest
   ago. The table is not kept after the app exits.
+- The card's trend counts time in 8-second steps that wrap after about 6 days
+  of listening.
 
 ## How it works
 

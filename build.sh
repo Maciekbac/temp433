@@ -27,11 +27,12 @@ command -v "$OBJCOPY" >/dev/null 2>&1 || { echo "❌ ARM objcopy not found: $OBJ
 
 # SIZE: optimisations that grow this code on Thumb-1 (more live registers,
 # more spills), switched off, each flag measured on its own (GCC 13.3, v0.4
-# with the sensor card: 4 to 20 B each; -fno-code-hoisting helped up to v0.3,
-# -fno-tree-sink up to the card, both now cost or save nothing). Measure them
-# again after a bigger change.
-SIZE="-fno-ipa-pure-const -fno-ipa-sra -fno-move-loop-invariants -fno-jump-tables \
-  -fno-tree-forwprop -fno-tree-tail-merge -fno-ssa-phiopt"
+# with the card's statistics: 8 to 44 B each; -fno-ipa-pure-const helped up
+# to the first card, -fno-code-hoisting up to v0.3, -fno-tree-sink up to the
+# first card, all three now cost or save nothing). Measure them again after a
+# bigger change.
+SIZE="-fno-ipa-sra -fno-move-loop-invariants -fno-jump-tables -fno-tree-forwprop \
+  -fno-tree-tail-merge -fno-ssa-phiopt -fno-tree-loop-im -fno-tree-dce"
 CFLAGS="-mcpu=cortex-m0plus -mthumb -Os -std=gnu11 -ffreestanding -fno-builtin -fno-common \
   -fomit-frame-pointer -ffunction-sections -fdata-sections $SIZE -Wall -Wextra -I$SDK -I."
 LDFLAGS="-nostdlib -nostartfiles -T app.ld -Wl,--defsym,APP_VMA=${APP_VMA} \
