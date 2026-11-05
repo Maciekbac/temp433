@@ -18,6 +18,9 @@ A receive-only overlay app for the
   frequency only.
 - For the selected sensor: the frequency it is heard on, its signal level, and
   how its temperature changed over the last 10-20 minutes.
+- A card for the selected sensor (`MENU`): its temperature and humidity in big
+  digits, readable from across the room, with its battery state and the time
+  since its last reading.
 - Receive only: the app never transmits.
 
 ## Requirements
@@ -82,7 +85,14 @@ bottom line shows that sensor's details:
   sensors of other kinds, or damaged frames. It is a count for the whole app,
   not for the selected sensor.
 
-**4. Listen on one frequency.** Started anywhere else on UHF, the app listens
+**4. Open the card.** `MENU` shows the selected sensor in big digits, with
+its battery state and the time since its last reading; its details stay in the
+bottom line. UP and DOWN go to the next sensor's card, `MENU` or `EXIT` back to
+the table.
+
+![The card of a sensor](docs/card.png)
+
+**5. Listen on one frequency.** Started anywhere else on UHF, the app listens
 on the VFO frequency only (VFO mode) and, until a sensor is heard, reminds you
 that key `5` searches the whole band:
 
@@ -94,12 +104,13 @@ On VHF the app asks you to tune the VFO to 433.920 first.
 
 | Key | Action |
 |---|---|
-| UP / DOWN | select a sensor |
+| UP / DOWN | select a sensor (on the card: the previous / next one) |
+| MENU | the selected sensor's card; back to the table |
 | 1 | speaker on / off (the sensor bursts are heard as buzzes) |
 | 2 | clear the table and the `?` count |
 | 3 | sensitivity: High (6 dB), Normal (10 dB), Low (15 dB) above the noise |
 | 5 | AUTO (433.80-434.04 MHz) or the VFO frequency |
-| EXIT | quit |
+| EXIT | quit (on the card: back to the table) |
 
 ## Tips
 
@@ -158,7 +169,8 @@ compared side by side, except for TFA-TWIN (see below).
 - TFA-TWIN shows the whole first byte as its ID, channel bits included; rtl_433
   leaves those out, so its ID is another number for the same sensor.
 - LACROSSE shows the temperature only (the humidity comes in separate frames)
-  and channel 0 (these sensors have none).
+  and channel 0 (these sensors have none). Its frames carry no battery state,
+  so its card has no battery line.
 - ESPERANZA also reads Kedsum and Conrad S3318P sensors (the same frame); the
   battery state of a Kedsum may be shown wrongly.
 - The table keeps 48 sensors; a new one then replaces the one heard longest
@@ -174,8 +186,9 @@ chosen sensitivity above that noise starts a capture: the audio is sampled at
 20 kHz until it goes quiet. The capture is cut into pulses and gaps, decoded
 as pulse-position (PPM) or pulse-width (PWM) bits, and matched against a table
 of protocols. One loop runs every checksum of the table: nibble and byte sums,
-CRC-4, CRC-8 and the LFSR digests. Fields sent least significant bit first or
-with their nibbles swapped are read in that order from the table, too.
+CRC-4, CRC-8 and the LFSR digests, each bit with its weight, computed when the
+app is built. Fields sent least significant bit first or with their nibbles
+swapped are read in that order from the table, too.
 
 ## Build
 
