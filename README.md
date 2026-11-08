@@ -54,7 +54,8 @@ main keys: `MENU` for a sensor's details, `1` speaker, `2` clear, `3`
 sensitivity and `5` AUTO / VFO.
 
 **2. Read the table.** Each heard sensor gets a row, in the order they were
-first heard:
+first heard (once the table is full, a new sensor takes the row of the one
+heard longest ago):
 
 ![The sensor table](docs/table.png)
 
@@ -182,8 +183,8 @@ compared side by side, except for TFA-TWIN (see below).
   so its card shows none.
 - ESPERANZA also reads Kedsum and Conrad S3318P sensors (the same frame); the
   battery state of a Kedsum may be shown wrongly.
-- The table keeps 64 sensors; a new one then replaces the one heard longest
-  ago. The table is not kept after the app exits.
+- The table keeps 64 sensors; a new one then takes the row of the one heard
+  longest ago. The table is not kept after the app exits.
 - The card's trend counts time in 8-second steps that wrap after about 6 days
   of listening.
 

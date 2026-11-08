@@ -37,18 +37,18 @@ def mid(a_us, b_us):
     """bit threshold between two times: a run longer than it is the long one"""
     return (a_us + b_us) // (2 * US)
 
-# The screen texts, read by draw() in one asset_read after the row.  The code
-# reads T_RANGE and T_DBM as strings (with a NUL); the pieces cut the others
-# by length, so they are packed with no NUL, each where its bytes already are
+# The screen texts, read by draw() in one asset_read after the row.  UI_CODE:
+# the texts the code reads as strings (with a NUL; none since v0.5, the dBm
+# after the level is written by the code); the pieces cut the others by
+# length, so they are packed with no NUL, each where its bytes already are
 # when they are (see the UI block below).
 RANGE = "433.80-434.04"          # AUTO: F_FIRST and N_PTS in temp433_app.c
-UI_CODE = ("T_RANGE", "T_DBM")
+UI_CODE = ()
 UI = [
     ("T_TITLE",  "TEMP 433"),
     ("T_AUTO",   "AUTO "),
     ("T_VFO",    "VFO "),
-    ("T_RANGE",  RANGE),                                  # AUTO, bottom line
-    ("T_DBM",    "dBm"),
+    ("T_RANGE",  RANGE),                                  # AUTO with no sensor, bottom line
     ("T_VHF1",   "No 433 sensors on VHF"),
     ("T_VHF2",   "Tune the VFO to 433.920"),
     ("T_HINT",   "5: search " + RANGE + " (AUTO)"),       # VFO, empty table
@@ -138,6 +138,9 @@ PIECES = [
     # (1 px from the left edge, as the key help)
     tiny("T_VHF1", 1, 17, (VHF, VHF)), tiny("T_VHF2", 1, 25, (VHF, VHF)),
     tiny("T_HINT", 1, 17, (VHF | EMPTY | AUTO, EMPTY)),
+    # the bottom line in AUTO with no sensor yet: the range (draw() writes
+    # nothing there then; the dotted line and ?N come after it)
+    tiny("T_RANGE", 0, 50, (VHF | EMPTY | AUTO, EMPTY | AUTO)),
     # the card:
     #   NEXUS            CH1 ID136 [3/12 ]  (the longest bold name ends at 63)
     #   v0.3C/14m  MIN -3.1  MAX 9.0         (the mark drawn by draw())
@@ -663,9 +666,10 @@ name_blob = b"".join(p[0].ljust(NAME_W).encode("ascii") for p in P)   # read int
 
 a = Assets("TEMP433")
 # The UI block, first in the assets: the texts the code reads (with a NUL),
-# then the piece texts with none, longest first, each where its bytes already
-# are when they are (dB in dBm): a piece's src is one byte, an offset into
-# draw()'s buffer, and the row with the card's values takes 72 of its 256.
+# then the piece texts with none, longest first, each where its bytes
+# already are when they are (the range in the VFO hint): a piece's src is one
+# byte, an offset into draw()'s buffer, and the row with the card's values
+# takes 72 of its 256.
 UIT = dict(UI)
 assert set(UIT) == {p[1] for p in PIECES if isinstance(p[1], str)} | set(UI_CODE), "a UI text unused"
 ui_blob, ui_at = b"", {}
