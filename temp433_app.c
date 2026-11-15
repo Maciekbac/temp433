@@ -51,7 +51,8 @@
  * MENU its card (big digits, the trend, min/max, reception; MENU or EXIT
  * back, UP/DOWN the next sensor), 1 speaker, 2 clear the table and the count
  * of unknown packets, 3 sensitivity (High 6 dB, Normal 10 dB, Low 15 dB above
- * the noise), 5 AUTO / VFO, EXIT quit.
+ * the noise), 4 Celsius / Fahrenheit (kept for the next launch), 5 AUTO / VFO,
+ * EXIT quit.
  */
 
 #include <stdint.h>
@@ -173,9 +174,9 @@ typedef struct {                       /* a reading, and a row of the sensor tab
     uint8_t rx, every, pt;             /* readings (up to 255), the shortest gap of */
                                        /* 5 s or more in 1.024 s (0xFF: none yet),  */
                                        /* the point (NO_PT: the VFO)                */
-    int16_t t10;                       /* 0.1 C                                     */
+    int16_t t90;                       /* 1/90 C above -40 C: see temperature()     */
     int16_t tmin, tmax;                /* since the first reading                   */
-    uint32_t ref, next;                /* trend (store()): t10 << 16 | ticks_ms >> 13 */
+    uint32_t ref, next;                /* trend (store()): t90 << 16 | ticks_ms >> 13 */
 } sensor_t;
 
 /* ---- screen ---- */
@@ -197,6 +198,8 @@ extern struct {
     uint8_t vhf, is_auto, pt, nrows, off, hold_pt, hold_w, aborted, pkt, card;
     uint8_t n, sel, top;               /* table: sensors, selected, first shown     */
     uint16_t ctrl, unk;                /* unk: packets no protocol took             */
+    uint8_t degc;                      /* the app's saved config byte: 0 Fahrenheit, */
+                                       /* else (0xFF: never saved) Celsius          */
     uint32_t vfo, hold_until, led_until, next_draw;   /* led_until 0: LED off       */
     sensor_t *rd;                      /* [N_SENS + 1] on app_main's stack: the     */
                                        /* reading match() decodes, then the sensors */
@@ -319,15 +322,22 @@ static char *put_fixed(char *o, int32_t v, uint32_t scale)
     return o;
 }
 
-/* 0.1 C as "-12.3" */
-#define put_t10(o, t) put_fixed(o, t, 10u)
-
 /* 10 Hz units -> "434.2125", "433.920" (at least the kHz): five decimals,
  * the last (10 Hz) left out */
 static char *put_freq(char *o, uint32_t f)
 {
     o = put_fixed(o, (int32_t)f, 100000u) - 1;
     return o[-1] == '0' ? o - 1 : o;
+}
+
+/* u in 1/90 C (see temperature()) as "-12.3", in 0.1 C or 0.1 F: a
+ * temperature above -40 with off 400 (-40 is the same in both), a difference
+ * (not negative) with off 0.  The divisor is odd, so its half rounds */
+SMALL static char *put_temp(char *o, uint32_t u, uint32_t off)
+{
+    G_BASE(gp);
+    const uint32_t d = gp->degc ? 9u : 5u;
+    return put_fixed(o, (int32_t)((u + (d >> 1)) / d - off), 10u);
 }
 
 /* the 3x5 font from the left edge, not inverted */
@@ -610,19 +620,20 @@ static bool check(const proto_t *p)
     return (x & ((1u << (p->cw & 15u)) - 1u)) == bits(p->cpos, p->cw);
 }
 
-/* 0.1 C from the 12 bits t (T_DEC: three decimal digits), less t_off as
- * gen_assets.py sets it: two's complement with bit 11 flipped, less 2048;
- * an offset x 10 below 0 C (0.1 C) or below 32 F (0.1 F; 720 less: the
- * -40 F of the conversion, from which it is rounded) */
-static int16_t temperature(const proto_t *p, unsigned t)
+/* The temperature in 1/90 C above -40 C (which is -40 F): 0.1 C is 9 of
+ * them and 0.1 F is 5, so a sensor's reading is exact in the scale it sends
+ * and put_temp() rounds only the other one.  From the 12 bits t (T_DEC: three
+ * decimal digits), less t_off as gen_assets.py sets it, the steps of 0.1 C
+ * or 0.1 F above -40: two's complement with bit 11 flipped, less 2048 - 400;
+ * an offset x 10 below 0 C, 400 less, or below 32 F, 720 less.  A reading
+ * below -40 comes out far above T_TOP, the 9900 of 70 C */
+static unsigned temperature(const proto_t *p, unsigned t)
 {
     const uint8_t fl = p->t_fl;
     if (fl & T_DEC)                     /* 100 d2 + 10 d1 + d0 */
         t = t - 6u * (t >> 4) - 60u * (t >> 8);
     t = (uint16_t)((t ^ ((fl & T_SIGNED) << 11)) - p->t_off);
-    if (fl & T_F)
-        t = (t * 5u + 4u) / 9u - 400u;  /* the low 16 bits are the result */
-    return (int16_t)t;
+    return t * (fl & T_F ? 5u : 9u);
 }
 
 /* the humidity field h (0: none) less h_off in % (over 100: no humidity, a
@@ -670,16 +681,16 @@ static bool match(unsigned f)
                 continue;
             /* the sanity checks of the rtl_433 decoders: a frame shifted by
              * a noise bit can pass a 4-bit check, and repeats as often */
-            const int16_t t = temperature(&p, v[V_T]);
+            const unsigned t = temperature(&p, v[V_T]);
             const uint8_t h = humidity(&p, v[V_H]);
             const unsigned ch = v[V_CH];
-            if (t < -400 || t > 700 || ((p.flags & F_HREJ) && h > 100u) || ((p.flags & F_CHNZ) && !ch))
+            if (t > T_TOP || ((p.flags & F_HREJ) && h > 100u) || ((p.flags & F_CHNZ) && !ch))
                 continue;
             sensor_t *const rd = g.rd;
             rd->proto = (uint8_t)i;
             rd->id = (uint8_t)v[V_ID];
             rd->ch = (uint8_t)(ch + (p.flags & F_CH1));
-            rd->t10 = t;
+            rd->t90 = (int16_t)t;
             rd->hum = h && h <= 100u ? h : NO_HUM;
             /* bit 0 the battery bit, inverted by F_BATOK; bit 1 F_NOBAT */
             rd->low = (uint8_t)((v[V_BAT] ^ (p.flags >> 1)) & 3u);
@@ -730,11 +741,11 @@ static void store(void)
         if ((int32_t)(t[i].seen - t[old].seen) < 0)
             old = i;
     }
-    const uint32_t now = (uint32_t)r->t10 << 16 | (uint16_t)(r->seen >> 13);
+    const uint32_t now = (uint32_t)r->t90 << 16 | (uint16_t)(r->seen >> 13);
     r->ref = r->next = now;
     r->rx = 1;
     r->every = 0xFFu;
-    r->tmin = r->tmax = r->t10;
+    r->tmin = r->tmax = r->t90;
     if (i < g.n) {
         const sensor_t *const o = t + i;
         r->ref = o->ref;
@@ -901,6 +912,7 @@ static char *put_age(char *o, uint32_t ms)
  * the selected one inverted:
  *   INFACTORY 3 205  -7.3C 100%  1m!
  *   model     ch id  temp  hum  age, low battery
+ * (the temperature in Celsius, or with key 4 in Fahrenheit: 18.9F)
  * or the card of the selected sensor (MENU): pieces of the same row in other
  * fonts and places (the model in bold, the temperature and humidity in the
  * big digits of the main screen, the battery and the age), and of the card's
@@ -950,8 +962,8 @@ static void draw(uint32_t now)
             asset(T_NAME + e->proto * T_NAME_STRIDE, b, T_NAME_STRIDE);
             b[10] = (char)('0' + e->ch);
             rput(b + 15, putu(v, e->id));
-            rput(b + 21, put_t10(v, e->t10));
-            b[21] = 'C';
+            rput(b + 21, put_temp(v, (uint32_t)e->t90, 400u));
+            b[21] = g.degc ? 'C' : 'F';
             if (e->hum == NO_HUM)           /* right-aligned: the card's % in one place */
                 b[24] = b[25] = '-';
             else {
@@ -976,19 +988,19 @@ static void draw(uint32_t now)
                     fl |= S_EVERY;
                     put_age(b + C_EVERY, (uint32_t)e->every << 10);
                 }
-                put_t10(b + C_MIN, e->tmin);
-                put_t10(b + C_MAX, e->tmax);
+                put_temp(b + C_MIN, (uint32_t)e->tmin, 400u);
+                put_temp(b + C_MAX, (uint32_t)e->tmax, 400u);
                 /* the change of the temperature since the trend reference,
                  * over how long (none for the first reading alone): one of
                  * 3 arrows (down, =, up) by its sign, 5 px in the 2 cells
                  * before it, on line 1 */
                 const unsigned span = (uint16_t)((e->seen >> 13) - e->ref);
                 if (span) {
-                    const int d = e->t10 - (int16_t)(e->ref >> 16);
+                    const int d = e->t90 - (int16_t)(e->ref >> 16);
                     asset(BMP_TREND + TREND_W + (unsigned)((d > 0) - (d < 0)) * TREND_W,
                           a->fb[1] + 1, TREND_W);
-                    o = put_fixed(b + C_TD + 2, d < 0 ? -d : d, 10u);
-                    *o++ = 'C';
+                    o = put_temp(b + C_TD + 2, (uint32_t)(d < 0 ? -d : d), 0u);
+                    *o++ = b[21];
                     *o++ = '/';
                     put_age(o, span << 13);
                 }
@@ -1099,6 +1111,10 @@ static void keys(void)
         reset();
         break;
     }
+    case APP_KEY_4:                    /* Celsius / Fahrenheit, for the next launch */
+        g.degc = !g.degc;              /* too: the loader saves it after the exit   */
+        A->cfg_save(&g.degc, 1);
+        break;
     case APP_KEY_5:
         if (!g.vhf) {
             g.is_auto ^= 1u;
@@ -1134,6 +1150,7 @@ void app_main(const app_api_t *api)
     g.floorq = floorq;
     g.rd = tab;                        /* the rest of g starts at 0 */
     g.prev = api->get_key();           /* the MENU that started the app */
+    api->cfg_load(&g.degc, 1);         /* erased flash reads 0xFF: Celsius */
 
     api->af_capture_open();            /* PA4 bias and ADC channel 4, restored by close */
     backlight_on();
