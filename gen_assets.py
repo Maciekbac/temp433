@@ -115,10 +115,16 @@ LOW, NOBAT, CARD_ON, VHF, EMPTY, AUTO, HELP = 1, 2, 4, 8, 16, 32, 64    # S_CARD
 # the card's values (column, width): its place in the list ("3/12"),
 # readings, the period, min, max, the trend (2 cells for its mark, then
 # "0.3C/14m")
-COLS = dict(C_POS=(33, 5), C_RX=(41, 3), C_EVERY=(44, 3),
-            C_MIN=(50, 5), C_MAX=(55, 5), C_TD=(60, 12))
-ROW_BUF = 72                           # draw(): the row and the values, then the UI block
-assert max(c + n for c, n in COLS.values()) <= ROW_BUF and ROW_BUF % 4 == 0
+# Where draw() writes a value is a multiple of 4 (the trend: its text, 2
+# cells after the column start): the buffer is on the stack, and Thumb-1
+# makes the address sp + n in one 2 B instruction only then (else 6 B).
+COLS = dict(C_POS=(36, 5), C_RX=(44, 3), C_EVERY=(48, 3),
+            C_MIN=(52, 5), C_MAX=(60, 5), C_TD=(66, 12))
+V_SIZE = 8                             # draw(): a number on its way into the row (v), the
+                                       # buffer's last bytes: no value's column reaches them
+ROW_BUF = 88                           # draw(): the row, the values and v, then the UI block
+assert max(c + n for c, n in COLS.values()) <= ROW_BUF - V_SIZE and ROW_BUF % 4 == 0
+assert all((c + 2 * (name == "C_TD")) % 4 == 0 for name, (c, n) in COLS.items())
 def ROW(col, n):
     return (col, n)
 def COL(name):
@@ -669,14 +675,16 @@ a = Assets("TEMP433")
 # then the piece texts with none, longest first, each where its bytes
 # already are when they are (the range in the VFO hint): a piece's src is one
 # byte, an offset into draw()'s buffer, and the row with the card's values
-# takes 72 of its 256.
+# takes ROW_BUF (88) of its 256.
 UIT = dict(UI)
 assert set(UIT) == {p[1] for p in PIECES if isinstance(p[1], str)} | set(UI_CODE), "a UI text unused"
 ui_blob, ui_at = b"", {}
 for name in UI_CODE:
     ui_at[name] = len(ui_blob)
     ui_blob += UIT[name].encode("ascii") + b"\0"
-for name in sorted(set(UIT) - set(UI_CODE), key=lambda n: -len(UIT[n])):
+# (by name among the equally long: a set has no order of its own, and the
+# assets must come out the same from every build)
+for name in sorted(set(UIT) - set(UI_CODE), key=lambda n: (-len(UIT[n]), n)):
     t = UIT[name].encode("ascii")
     i = ui_blob.find(t)
     if i < 0:
@@ -697,7 +705,7 @@ def piece(fn, text, x, a1, a2, a3, a4, cond):
     else:
         src, n = text
         # the row's columns (the ! at 31 left out), or the card's values after its NUL
-        assert src + n <= 31 or src > 32 and src + n <= ROW_BUF, text
+        assert src + n <= 31 or src > 32 and src + n <= ROW_BUF - V_SIZE, text
     assert src + n < 256 and 0 < n and x < 128 and cond[1] & ~cond[0] == 0, text
     assert fn != FN_TINY or a2 or x + 4 * n - 1 <= 128, text      # the 3x5 font fits the screen
     return bytes((fn, src, n, x, a1, a2, a3, a4) + cond)
@@ -705,6 +713,7 @@ pieces_blob = b"".join(piece(*c) for c in PIECES) + b"\0"
 assert all(len(piece(*c)) == PIECE_SIZE for c in PIECES)
 a.const("UI_SIZE", ui_size)
 a.const("ROW_BUF", ROW_BUF)
+a.const("V_SIZE", V_SIZE)
 for name, (col, _) in COLS.items():
     a.const(name, col)
 a.const("PIECE_SIZE", PIECE_SIZE)
