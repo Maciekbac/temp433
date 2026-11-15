@@ -9,7 +9,7 @@ cd "$(dirname "$0")"
 
 APP=temp433
 APP_NAME="Temp 433"
-APP_VER="0.4"
+APP_VER="0.5"
 APP_API_MIN=3
 APP_VMA=${APP_VMA:-0x20000280}
 OUT="${APP_NAME// /}"
@@ -26,13 +26,14 @@ command -v "$CC" >/dev/null 2>&1 || { echo "❌ ARM compiler not found: $CC"; ex
 command -v "$OBJCOPY" >/dev/null 2>&1 || { echo "❌ ARM objcopy not found: $OBJCOPY"; exit 1; }
 
 # SIZE: optimisations that grow this code on Thumb-1 (more live registers,
-# more spills), switched off, each flag measured on its own (GCC 13.3, v0.4
-# with the card's statistics: 8 to 44 B each; -fno-ipa-pure-const helped up
-# to the first card, -fno-code-hoisting up to v0.3, -fno-tree-sink up to the
-# first card, all three now cost or save nothing). Measure them again after a
-# bigger change.
-SIZE="-fno-ipa-sra -fno-move-loop-invariants -fno-jump-tables -fno-tree-forwprop \
-  -fno-tree-tail-merge -fno-ssa-phiopt -fno-tree-loop-im -fno-tree-dce"
+# more spills) switched off, and -frename-registers (fewer moves) and
+# -fschedule-fusion on. Picked from all of GCC 13.3's optimisation flags; each
+# one, left out of the set, costs 4 to 52 B (v0.5, 128 B together;
+# -fno-tree-forwprop helped up to v0.4 and then cost 12 B). GCC's choices shift
+# with every change, so measure them again after a bigger one.
+SIZE="-fno-ipa-sra -fno-move-loop-invariants -fno-jump-tables -fno-tree-tail-merge \
+  -fno-ssa-phiopt -fno-tree-loop-im -fno-tree-dce -frename-registers -fno-tree-loop-optimize \
+  -fno-guess-branch-probability -fschedule-fusion"
 CFLAGS="-mcpu=cortex-m0plus -mthumb -Os -std=gnu11 -ffreestanding -fno-builtin -fno-common \
   -fomit-frame-pointer -ffunction-sections -fdata-sections $SIZE -Wall -Wextra -I$SDK -I."
 LDFLAGS="-nostdlib -nostartfiles -T app.ld -Wl,--defsym,APP_VMA=${APP_VMA} \

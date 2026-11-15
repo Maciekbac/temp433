@@ -37,18 +37,18 @@ def mid(a_us, b_us):
     """bit threshold between two times: a run longer than it is the long one"""
     return (a_us + b_us) // (2 * US)
 
-# The screen texts, read by draw() in one asset_read after the row.  The code
-# reads T_RANGE and T_DBM as strings (with a NUL); the pieces cut the others
-# by length, so they are packed with no NUL, each where its bytes already are
+# The screen texts, read by draw() in one asset_read after the row.  UI_CODE:
+# the texts the code reads as strings (with a NUL; none since v0.5, the dBm
+# after the level is written by the code); the pieces cut the others by
+# length, so they are packed with no NUL, each where its bytes already are
 # when they are (see the UI block below).
 RANGE = "433.80-434.04"          # AUTO: F_FIRST and N_PTS in temp433_app.c
-UI_CODE = ("T_RANGE", "T_DBM")
+UI_CODE = ()
 UI = [
     ("T_TITLE",  "TEMP 433"),
     ("T_AUTO",   "AUTO "),
     ("T_VFO",    "VFO "),
-    ("T_RANGE",  RANGE),                                  # AUTO, bottom line
-    ("T_DBM",    "dBm"),
+    ("T_RANGE",  RANGE),                                  # AUTO with no sensor, bottom line
     ("T_VHF1",   "No 433 sensors on VHF"),
     ("T_VHF2",   "Tune the VFO to 433.920"),
     ("T_HINT",   "5: search " + RANGE + " (AUTO)"),       # VFO, empty table
@@ -56,7 +56,6 @@ UI = [
     ("T_CH",     "CH"),
     ("T_ID",     "ID"),
     ("T_DEG",    "o"),                                    # the 3x5 o, raised: a degree sign
-    ("T_C",      "C"),
     ("T_MIN",    "MIN"),
     ("T_MAX",    "MAX"),
     ("T_EVERY",  "EVERY"),
@@ -101,7 +100,7 @@ TREND = [[0x04, 0x0C, 0x1C, 0x0C, 0x04],    # down
 # (the card sensor's low: battery low, no battery state sent), CARD_ON, VHF,
 # EMPTY (no sensor yet), AUTO.  Pieces of the row: ROW(column, length); its
 # columns: 0-8 model, 10 channel, 12-14 ID, 16-20 temperature
-# (right-aligned), 21 C, 23-25 humidity (right-aligned or --), 26 % (a space
+# (right-aligned), 21 C or F, 23-25 humidity (right-aligned or --), 26 % (a space
 # without humidity), 27-30 age, 32 its NUL; on the card the values draw()
 # writes after it, left-aligned: COL(name) (see COLS).  x in pixels; the 3x5
 # font by y from the frame buffer top (line l at 8 l; status: the status
@@ -115,10 +114,16 @@ LOW, NOBAT, CARD_ON, VHF, EMPTY, AUTO, HELP = 1, 2, 4, 8, 16, 32, 64    # S_CARD
 # the card's values (column, width): its place in the list ("3/12"),
 # readings, the period, min, max, the trend (2 cells for its mark, then
 # "0.3C/14m")
-COLS = dict(C_POS=(33, 5), C_RX=(41, 3), C_EVERY=(44, 3),
-            C_MIN=(50, 5), C_MAX=(55, 5), C_TD=(60, 12))
-ROW_BUF = 72                           # draw(): the row and the values, then the UI block
-assert max(c + n for c, n in COLS.values()) <= ROW_BUF and ROW_BUF % 4 == 0
+# Where draw() writes a value is a multiple of 4 (the trend: its text, 2
+# cells after the column start): the buffer is on the stack, and Thumb-1
+# makes the address sp + n in one 2 B instruction only then (else 6 B).
+COLS = dict(C_POS=(36, 5), C_RX=(44, 3), C_EVERY=(48, 3),
+            C_MIN=(52, 5), C_MAX=(60, 5), C_TD=(66, 12))
+V_SIZE = 8                             # draw(): a number on its way into the row (v), the
+                                       # buffer's last bytes: no value's column reaches them
+ROW_BUF = 88                           # draw(): the row, the values and v, then the UI block
+assert max(c + n for c, n in COLS.values()) <= ROW_BUF - V_SIZE and ROW_BUF % 4 == 0
+assert all((c + 2 * (name == "C_TD")) % 4 == 0 for name, (c, n) in COLS.items())
 def ROW(col, n):
     return (col, n)
 def COL(name):
@@ -138,6 +143,9 @@ PIECES = [
     # (1 px from the left edge, as the key help)
     tiny("T_VHF1", 1, 17, (VHF, VHF)), tiny("T_VHF2", 1, 25, (VHF, VHF)),
     tiny("T_HINT", 1, 17, (VHF | EMPTY | AUTO, EMPTY)),
+    # the bottom line in AUTO with no sensor yet: the range (draw() writes
+    # nothing there then; the dotted line and ?N come after it)
+    tiny("T_RANGE", 0, 50, (VHF | EMPTY | AUTO, EMPTY | AUTO)),
     # the card:
     #   NEXUS            CH1 ID136 [3/12 ]  (the longest bold name ends at 63)
     #   v0.3C/14m  MIN -3.1  MAX 9.0         (the mark drawn by draw())
@@ -150,7 +158,7 @@ PIECES = [
     tiny(COL("C_TD"), 0, 9),
     tiny("T_MIN", 48, 9), tiny(COL("C_MIN"), 64, 9), tiny("T_MAX", 88, 9), tiny(COL("C_MAX"), 104, 9),
     big(ROW(16, 5), 0, 2),
-    tiny("T_DEG", 57, 15), bold("T_C", 61, 2),
+    tiny("T_DEG", 57, 15), bold(ROW(21, 1), 61, 2),
     big(ROW(23, 3), 76, 2), bold(ROW(26, 1), 116, 2),
     tiny("T_EVERY", 0, 33, (CARD_ON | 128, CARD_ON | 128)), tiny(COL("C_EVERY"), 24, 33),
     tiny("T_LAST", 44, 33), tiny(ROW(28, 3), 64, 33),
@@ -165,8 +173,8 @@ PIECES = [
 # slice of it.
 #   MENU details
 #   1 speaker 2 clear 3 sensitivity
-#   5 AUTO/VFO
-HELP_TEXTS = ["MENU details", "1 speaker", "2 clear", "3 sensitivity", "5 AUTO/VFO"]
+#   4 C/F 5 AUTO/VFO
+HELP_TEXTS = ["MENU details", "1 speaker", "2 clear", "3 sensitivity", "4 C/F", "5 AUTO/VFO"]
 help_blob = "".join(HELP_TEXTS).encode("ascii")
 assert len(help_blob) <= ROW_BUF
 def HLP(text):
@@ -175,7 +183,7 @@ PIECES += [
     tiny(HLP("MENU details"), 1, 25, (HELP, HELP)),
     tiny(HLP("1 speaker"), 1, 33, (HELP, HELP)), tiny(HLP("2 clear"), 41, 33, (HELP, HELP)),
     tiny(HLP("3 sensitivity"), 73, 33, (HELP, HELP)),
-    tiny(HLP("5 AUTO/VFO"), 1, 41, (HELP, HELP)),
+    tiny(HLP("4 C/F"), 1, 41, (HELP, HELP)), tiny(HLP("5 AUTO/VFO"), 25, 41, (HELP, HELP)),
 ]
 PIECE_SIZE = 10
 
@@ -256,7 +264,8 @@ def lfsr_digest_fwd(gen, key):
     return (C_DIGEST, key, 0, gen, 0, NO_SUB)
 
 # temperature: t_fl flags, t_off x 10 below 0 C (0.1 C) or below 32 F (0.1 F);
-# pack() turns them into the t_off of temperature() in temp433_app.c
+# pack() turns them into the t_off of temperature() in temp433_app.c, which
+# leaves the steps above -40 (C and F alike)
 T_SIGNED, T_DEC, T_F = 1, 4, 8
 T_LE = 2                          # the temperature nibbles last to first: pack() only (x 12)
 S12 = (T_SIGNED, 0)
@@ -441,15 +450,14 @@ def pack(entry):
     r["keys"] = weights(r["old"], ck, name)
     r["c1"] = len(r["keys"])
     assert skip + r["c1"] <= ROW_BITS and r["c1"] < 256, name
-    # temperature(): (t ^ T_SIGNED << 11) - t_off, so t_off is 2048 for two's
-    # complement, else the offset x 10, and 720 less for F (the -40 F the
-    # conversion rounds from)
+    # temperature(): (t ^ T_SIGNED << 11) - t_off in 16 bits, the steps of
+    # 0.1 C or 0.1 F above -40: t_off is 2048 for two's complement, else the
+    # offset x 10, less the 400 (C) or 720 (F) from -40 up to 0 C or 32 F
     if tfl & T_SIGNED:
         assert not toff and not tfl & (T_DEC | T_F), name
-        r["t_off"] = 2048
+        r["t_off"] = 2048 - 400
     else:
-        r["t_off"] = toff * 10 - (720 if tfl & T_F else 0)
-        assert 0 <= r["t_off"] < 1 << 16, name
+        r["t_off"] = (toff * 10 - (720 if tfl & T_F else 400)) & 0xFFFF
     return r
 
 def blob(r):
@@ -503,18 +511,19 @@ def _check(r, b):
         return False
     return (x & ((1 << (r["cw"] & 15)) - 1)) == _field(b, r["cpos"], r["cw"])
 
+T_TOP = 9900                      # 70 C in the 1/90 C above -40 C of temperature()
+
 def _temp(r, t):
-    """temperature() in temp433_app.c (C unsigned arithmetic, then int16)"""
+    """temperature() in temp433_app.c: 1/90 C above -40 C (0.1 C is 9, 0.1 F
+    is 5), over T_TOP when out of -40 .. 70 C"""
     fl = r["t_fl"]
     if fl & T_DEC:
         t = t - 6 * (t >> 4) - 60 * (t >> 8)
     t = ((t ^ ((fl & T_SIGNED) << 11)) - r["t_off"]) & 0xFFFF
-    if fl & T_F:
-        t = ((t * 5 + 4) // 9 - 400) & 0xFFFF
-    return t - 65536 if t >= 32768 else t
+    return t * (5 if fl & T_F else 9)
 
 def _temp_old(tfl, toff, t):
-    """temperature() up to v0.3 (the reference for _temp)"""
+    """temperature() up to v0.3, in 0.1 C (the reference for _temp)"""
     if tfl & T_DEC:
         t = ((t >> 8) * 10 + ((t >> 4) & 15)) * 10 + (t & 15)
     if tfl & T_SIGNED:
@@ -537,8 +546,15 @@ for _ in range(256):
     for e, r in zip(P, RECORDS):
         mask = 0xFFFF if r["check"] == C_SUM else 0xFF
         assert (_x(r, row) ^ _x_old(r, row)) & mask == 0, e[0]
+# (the same readings pass the range check as up to v0.5, with the same 0.1 C
+# as put_temp() rounds them; an F sensor's 0.1 F come back as sent)
 for (name, *_, (tpos, tfl, toff), hum), r in zip(P, RECORDS):
-    assert all(_temp(r, t) == _temp_old(tfl & ~T_LE, toff, t) for t in range(4096)), name
+    for t in range(4096):
+        u, old = _temp(r, t), _temp_old(tfl & ~T_LE, toff, t)
+        assert (u <= T_TOP) == (-400 <= old <= 700), name
+        if u <= T_TOP:
+            assert (u + 4) // 9 - 400 == old, name
+            assert not tfl & T_F or (u + 2) // 5 - 400 == t - toff * 10 + 320, name
 
 def _sum(b, skip, c1, w):
     """the w-bit units of the first c1 bits added up, the last one zero padded"""
@@ -663,16 +679,19 @@ name_blob = b"".join(p[0].ljust(NAME_W).encode("ascii") for p in P)   # read int
 
 a = Assets("TEMP433")
 # The UI block, first in the assets: the texts the code reads (with a NUL),
-# then the piece texts with none, longest first, each where its bytes already
-# are when they are (dB in dBm): a piece's src is one byte, an offset into
-# draw()'s buffer, and the row with the card's values takes 72 of its 256.
+# then the piece texts with none, longest first, each where its bytes
+# already are when they are (the range in the VFO hint): a piece's src is one
+# byte, an offset into draw()'s buffer, and the row with the card's values
+# takes ROW_BUF (88) of its 256.
 UIT = dict(UI)
 assert set(UIT) == {p[1] for p in PIECES if isinstance(p[1], str)} | set(UI_CODE), "a UI text unused"
 ui_blob, ui_at = b"", {}
 for name in UI_CODE:
     ui_at[name] = len(ui_blob)
     ui_blob += UIT[name].encode("ascii") + b"\0"
-for name in sorted(set(UIT) - set(UI_CODE), key=lambda n: -len(UIT[n])):
+# (by name among the equally long: a set has no order of its own, and the
+# assets must come out the same from every build)
+for name in sorted(set(UIT) - set(UI_CODE), key=lambda n: (-len(UIT[n]), n)):
     t = UIT[name].encode("ascii")
     i = ui_blob.find(t)
     if i < 0:
@@ -693,7 +712,7 @@ def piece(fn, text, x, a1, a2, a3, a4, cond):
     else:
         src, n = text
         # the row's columns (the ! at 31 left out), or the card's values after its NUL
-        assert src + n <= 31 or src > 32 and src + n <= ROW_BUF, text
+        assert src + n <= 31 or src > 32 and src + n <= ROW_BUF - V_SIZE, text
     assert src + n < 256 and 0 < n and x < 128 and cond[1] & ~cond[0] == 0, text
     assert fn != FN_TINY or a2 or x + 4 * n - 1 <= 128, text      # the 3x5 font fits the screen
     return bytes((fn, src, n, x, a1, a2, a3, a4) + cond)
@@ -701,6 +720,7 @@ pieces_blob = b"".join(piece(*c) for c in PIECES) + b"\0"
 assert all(len(piece(*c)) == PIECE_SIZE for c in PIECES)
 a.const("UI_SIZE", ui_size)
 a.const("ROW_BUF", ROW_BUF)
+a.const("V_SIZE", V_SIZE)
 for name, (col, _) in COLS.items():
     a.const(name, col)
 a.const("PIECE_SIZE", PIECE_SIZE)
@@ -742,6 +762,7 @@ a.raw("KEYS", keys_blob)
 a.raw("HELP", help_blob)
 a.const("HELP_SIZE", len(help_blob))
 a.raw("PIECES", pieces_blob)                   # draw() reads it piece by piece
+a.const("T_TOP", T_TOP)                        # match(): the highest temperature taken
 a.const("KEY_MAX", max(len(r["keys"]) for r in RECORDS))   # check() reads them onto the stack
 assert dict((n, o) for n, o, _ in a.build()[1])["KEYS"] == keys_at
 a.main()

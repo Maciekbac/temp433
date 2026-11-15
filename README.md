@@ -21,6 +21,7 @@ A receive-only overlay app for the
   digits, readable from across the room, how the temperature changed over the
   last 10-20 minutes, its lowest and highest temperature, and how it is
   received: how often it sends and how many readings came.
+- Temperatures in °C or °F (key `4`); the choice is kept for the next launch.
 - Until the table has four sensors, its free rows show the main keys.
 - Receive only: the app never transmits.
 
@@ -51,10 +52,11 @@ the whole band, because the sensors' frequencies spread up to ±75 kHz around
 Most sensors transmit every 30-90 seconds, so the first rows come after a
 minute or two. Until four sensors are in the table, its bottom rows list the
 main keys: `MENU` for a sensor's details, `1` speaker, `2` clear, `3`
-sensitivity and `5` AUTO / VFO.
+sensitivity, `4` °C / °F and `5` AUTO / VFO.
 
 **2. Read the table.** Each heard sensor gets a row, in the order they were
-first heard:
+first heard (once the table is full, a new sensor takes the row of the one
+heard longest ago):
 
 ![The sensor table](docs/table.png)
 
@@ -63,7 +65,7 @@ first heard:
 | model | `INFACTORY` | the sensor type (see the table below) |
 | channel | `3` | the channel switch of the sensor |
 | ID | `205` | a code the sensor picks, often anew after a battery change |
-| temperature | `4.9C` | °C |
+| temperature | `4.9C` | °C, or with key `4` °F (`40.8F`) |
 | humidity | `92%` | `--` for sensors without one |
 | age | `8s` | time since the last reading (`s`, `m`, `h`) |
 | `!` | `8s!` | low battery |
@@ -118,6 +120,7 @@ On VHF the app asks you to tune the VFO to 433.920 first.
 | 1 | speaker on / off (the sensor bursts are heard as buzzes) |
 | 2 | clear the table and the `?` count |
 | 3 | sensitivity: High (6 dB), Normal (10 dB), Low (15 dB) above the noise |
+| 4 | temperatures in °C or °F, in the table and on the card; kept for the next launch |
 | 5 | AUTO (433.80-434.04 MHz) or the VFO frequency |
 | EXIT | quit (on the card: back to the table) |
 
@@ -168,7 +171,7 @@ compared side by side, except for TFA-TWIN (see below).
 ## Limitations
 
 - A humidity outside 1-100 % shows as `--` (rtl_433 drops such a frame).
-- Temperatures outside -40 to 70 °C are dropped as misreadings.
+- Temperatures outside -40 to 70 °C (-40 to 158 °F) are dropped as misreadings.
 - GT-WT-02 and GT-WT-03 humidity codes 10 and 110, which rtl_433 shows as 0 %
   and 100 %, show as `10%` and `--`.
 - Nexus, Prologue and Auriol AFW 2 A1 send no checksum: a reading counts once
@@ -182,8 +185,8 @@ compared side by side, except for TFA-TWIN (see below).
   so its card shows none.
 - ESPERANZA also reads Kedsum and Conrad S3318P sensors (the same frame); the
   battery state of a Kedsum may be shown wrongly.
-- The table keeps 64 sensors; a new one then replaces the one heard longest
-  ago. The table is not kept after the app exits.
+- The table keeps 64 sensors; a new one then takes the row of the one heard
+  longest ago. The table is not kept after the app exits.
 - The card's trend counts time in 8-second steps that wrap after about 6 days
   of listening.
 
